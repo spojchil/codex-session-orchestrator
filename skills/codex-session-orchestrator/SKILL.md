@@ -116,9 +116,14 @@ run 目录里可直接读的文件：`state.json`（实时状态）、`result.js
 {"phase": "...", "completed": ["..."], "next": "...", "blocker": null}
 ```
 
-监督进程自动 tail 这个文件（文件名可用 `--progress-file` 改），最新一条显示在
-`status` 的 `report:` 行；**每次上报会重置无事件卡死计时**，长命令的静默期不再误报
-stalled。上报是语义补充，不作为存活的唯一判据——走偏或卡住的代理可能根本不上报。
+监督进程自动 tail 这个文件（文件名可用 `--progress-file` 改，解析后的绝对路径在
+`state.json.progress_path`），最新一条显示在 `status` 的 `report:` 行；**每次上报会
+重置无事件卡死计时**，长命令的静默期不再误报 stalled。上报是语义补充，不作为存活的
+唯一判据——走偏或卡住的代理可能根本不上报。
+
+**跨 run 不冒充**：续跑的新 run 会把工作区里已有的旧上报标为 `[historical, previous run]`
+展示，只有本 run 的新上报才算当前进度（带 `origin_run_id`）——上一轮的
+"milestone=completed" 不会掩盖正在返工的事实。
 
 ## 中途改方向：steer（语义 = interrupt-and-resume）
 
@@ -134,6 +139,16 @@ python .../codexctl.py steer <run> "纠偏提示词"        # 或 --prompt-file 
 输出最后一行是结构化 JSON：`{"steer": {"old_run", "new_run", "session_id", "boundary"}}`
 ——**监控目标要切到 new_run**；旧 run 的状态会写入 `superseded_by`，会话索引
 （`~/.codex-orchestrator/sessions.json`）始终指向当前 run。
+
+**boundary 是一等信号，读它判断这次纠偏的代价**：
+
+| boundary | 含义 | 代价 |
+|---|---|---|
+| `completed` | 旧 run 早已终态，直接续接 | 无损 |
+| `item` | 在条目边界停下 | 低（已完成的工作全保留） |
+| `forced` | 宽限期内没等到边界，强停 | **有损**：在途的远端推理被丢弃，按一次真实中断对待 |
+
+等边界期间 `status` 会显示 `pending:` 行（已请求、正在等边界）。
 
 只想停不想续：
 
@@ -171,6 +186,11 @@ python .../codexctl.py resume <session-id> "后续任务"     # dispatch --sessi
 python .../codexctl.py compact <session-id>               # 主动触发上下文压缩
 python .../codexctl.py fork <session-id>                  # 只分叉不执行，返回新 id
 ```
+
+**`resume` 不带 `-C` 时自动继承该会话上一个 run 的工作目录**——手工续跑不会再落到
+编排方当前所在的目录（多工作树 + 宽沙箱下那是把半成品写进主仓库的路）。显式 `-C`
+仍可覆盖，但与会话历史目录不一致时会打警告。`recommended_resume` / `result.json`
+里的续跑命令永远带绝对 `-C`。
 
 `compact` 会临时拉起 app-server 对该会话做真实的上下文压缩（压缩事件写进会话文件，
 完成后自动确认）。长会话在 `status` 显示上下文占用偏高时先压缩再续接。

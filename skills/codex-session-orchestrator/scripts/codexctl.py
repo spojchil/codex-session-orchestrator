@@ -537,7 +537,8 @@ class Supervisor:
         if typ == "thread.started":
             sid = obj.get("thread_id")
             self.set(session_id=sid, phase="requesting_model",
-                     recommended_resume=f'python "{SELF}" resume {sid} "<prompt>"')
+                     recommended_resume=(f'python "{SELF}" resume {sid} '
+                                         f'-C "{self.cfg["cwd"]}" --prompt-file <path>'))
         elif typ == "turn.started":
             counts["turns"] = counts.get("turns", 0) + 1
             self.set(phase="requesting_model")
@@ -688,12 +689,39 @@ class Supervisor:
                 tokens["context_used_pct"] = round(used * 100 / window, 1)
             self.dirty = True
 
+    def progress_path(self) -> Path:
+        return Path(self.cfg["cwd"]) / (self.cfg.get("progress_file") or ".codex-progress.jsonl")
+
+    def init_progress(self):
+        """A resumed run inherits the workspace progress file. Pre-existing lines are
+        from PREVIOUS runs: surface the last one as historical context, never as the
+        current run's progress — a stale 'completed' milestone must not mask a rework."""
+        path = self.progress_path()
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return
+        if not size:
+            return
+        self.progress_offset = size
+        try:
+            lines = [l for l in path.read_text(encoding="utf-8", errors="replace").splitlines()
+                     if l.strip()]
+        except OSError:
+            return
+        if lines:
+            try:
+                obj = json.loads(lines[-1])
+            except json.JSONDecodeError:
+                obj = {"note": trim(lines[-1], 200)}
+            self.set(agent_report={"inherited": obj, "historical": True, "count": 0})
+
     def tail_progress(self):
         """Agent-side reporting: the task brief may ask codex to append JSON lines to a
         progress file in its workspace. Append-only; a report resets the stall timer so a
         long quiet command with live reports is not misread as a hang. Semantic garnish
         only — never the sole liveness signal."""
-        path = Path(self.cfg["cwd"]) / (self.cfg.get("progress_file") or ".codex-progress.jsonl")
+        path = self.progress_path()
         try:
             if path.stat().st_size <= self.progress_offset:
                 return
@@ -712,7 +740,10 @@ class Supervisor:
             except json.JSONDecodeError:
                 obj = {"note": trim(raw, 200)}
             report = self.state.setdefault("agent_report", {})
+            report.pop("inherited", None)
+            report.pop("historical", None)
             report["last"] = obj
+            report["origin_run_id"] = self.cfg["run_id"]
             report["count"] = report.get("count", 0) + 1
             report["at"] = utcnow_iso()
             self.last_activity_mono = time.monotonic()
@@ -819,6 +850,8 @@ class Supervisor:
             # Normalized at dispatch; shown here so a misconfigured guard is visible
             # instead of silently firing.
             self.set(allowed_paths=cfg["allowed_paths"])
+        self.set(progress_path=str(self.progress_path()))
+        self.init_progress()
         self.flush(force=True)
 
         if IS_WIN:
@@ -948,7 +981,8 @@ class Supervisor:
             "dirty_files": self.state.get("dirty_files"),
             "diff_stat": self.state.get("diff_stat"),
             "final_message_file": str(last_message) if last_message.exists() else None,
-            "resume_cmd": f'python "{SELF}" resume {sid} "<prompt>"' if sid else None,
+            "resume_cmd": (f'python "{SELF}" resume {sid} -C "{self.cfg["cwd"]}" '
+                           f'--prompt-file <path>') if sid else None,
         }
         atomic_write_json(self.run_dir / "result.json", result)
         self.set(phase=phase, finished_at=result["finished_at"], exit_code=exit_code)
@@ -959,7 +993,9 @@ class Supervisor:
 
 
 def shared_dispatch_flags(p: argparse.ArgumentParser):
-    p.add_argument("-C", "--project-dir", default=os.getcwd(), help="Directory codex runs in.")
+    p.add_argument("-C", "--project-dir", default=None,
+                   help="Directory codex runs in. Resumes inherit the session's previous "
+                        "directory when omitted; new dispatches use the current directory.")
     p.add_argument("--sandbox", choices=["read-only", "workspace-write", "danger-full-access"])
     p.add_argument("--model")
     p.add_argument("--reasoning-effort",
@@ -987,8 +1023,28 @@ def shared_dispatch_flags(p: argparse.ArgumentParser):
     p.add_argument("--wait", action="store_true", help="Block until the run finishes.")
 
 
+def session_cwd(session_id: str):
+    """The workspace the session last ran in, via the session index."""
+    if not session_id:
+        return None
+    index = read_json(sessions_index_path()) or {}
+    current = (index.get(session_id) or {}).get("current_run_id")
+    if not current:
+        return None
+    run_cfg = read_json(runs_root() / current / "run.json") or {}
+    return run_cfg.get("cwd")
+
+
 def cfg_from_args(args, resume_id=None, fork_from=None) -> dict:
-    project_dir = Path(args.project_dir).resolve()
+    # A resume that omits -C must land in the session's own worktree, not wherever the
+    # orchestrator happens to be standing — with a wide sandbox that difference is how
+    # half-finished work ends up in the main repo.
+    inherited = session_cwd(resume_id or fork_from)
+    if args.project_dir and inherited and \
+            str(Path(args.project_dir).resolve()) != str(Path(inherited).resolve()):
+        print(f"warning: -C differs from the session's previous cwd ({inherited}); "
+              f"proceeding with the explicit -C", file=sys.stderr)
+    project_dir = Path(args.project_dir or inherited or os.getcwd()).resolve()
     if not project_dir.exists():
         raise SystemExit(f"project directory does not exist: {project_dir}")
     if project_dir == Path.home():
@@ -1167,6 +1223,9 @@ def render_status(run_dir: Path, as_json=False):
     activity = state.get("activity")
     if live and activity:
         print(f"activity: {activity.get('kind')}  {trim(activity.get('detail'), 90)}")
+    if live and state.get("cancel_requested") and phase not in TERMINAL_PHASES:
+        print(f"pending:  cancel/steer requested ({state['cancel_requested']}) — "
+              f"waiting for an item boundary")
     progress = state.get("progress")
     if progress:
         print(f"plan:     {progress['completed']}/{progress['total']} done")
@@ -1178,6 +1237,10 @@ def render_status(run_dir: Path, as_json=False):
         last = report["last"]
         parts = [f"{k}={trim(str(v), 60)}" for k, v in list(last.items())[:4]]
         print(f"report:   {'  '.join(parts)}  ({report.get('count', 0)} reports)")
+    elif report and report.get("inherited"):
+        last = report["inherited"]
+        parts = [f"{k}={trim(str(v), 50)}" for k, v in list(last.items())[:3]]
+        print(f"report:   [historical, previous run] {'  '.join(parts)}")
     tokens = state.get("tokens") or {}
     total = tokens.get("total") or {}
     if total:
@@ -1456,8 +1519,16 @@ def cmd_steer(args):
     if not prompt.strip():
         raise SystemExit("prompt is empty")
 
-    state = stop_run(run_dir, args.grace, "steer")
-    print(f"stopped {run_dir.name}")
+    # boundary semantics: "completed" = the old run had already finished (lossless),
+    # "item" = stopped between items (cheap), "forced" = grace expired mid-item and
+    # in-flight remote reasoning was discarded (lossy — treat as a real interruption).
+    entry_phase = state.get("phase")
+    if entry_phase in TERMINAL_PHASES:
+        boundary = "completed"
+    else:
+        state = stop_run(run_dir, args.grace, "steer")
+        boundary = state.get("cancel_boundary") or "unknown"
+        print(f"stopped {run_dir.name} (boundary={boundary})")
 
     cfg = dict(old_cfg)
     cfg.update({"run_id": new_run_id(), "resume_id": session_id, "fork_from": None,
@@ -1465,7 +1536,7 @@ def cmd_steer(args):
     launch(cfg, prompt, wait=args.wait)
     print(json.dumps({"steer": {
         "old_run": run_dir.name, "new_run": cfg["run_id"], "session_id": session_id,
-        "boundary": state.get("cancel_boundary"),
+        "boundary": boundary,
         "mode": "interrupt-and-resume",
     }}, ensure_ascii=False))
 
@@ -1665,12 +1736,18 @@ def cmd_compact(args):
         raise SystemExit("timed out waiting for compaction; check the session manually")
 
 
-DEFAULT_CHECKPOINT_PROMPT = (
-    "把当前进度写成 checkpoint，只做这一件事：在工作区根写入或更新 CHECKPOINT.md，内容包括"
-    "（1）已完成的事项，（2）改到一半的文件与所处状态，（3）恢复工作的第一条命令，"
-    "（4）剩余待办清单，（5）不许越出的范围。同时向 .codex-progress.jsonl 追加一行 "
-    '{"phase":"checkpoint"}。不要做任何其他修改，写完立即回复 checkpoint-done。'
-)
+def make_checkpoint_prompt(cwd: str, progress_file: str) -> str:
+    """Absolute paths only: agents resolve relative paths against surprising anchors
+    when several worktrees share a main repo (observed: checkpoint written to the main
+    workspace instead of the run's worktree)."""
+    checkpoint = Path(cwd) / "CHECKPOINT.md"
+    progress = Path(cwd) / progress_file
+    return (
+        f"把当前进度写成 checkpoint，只做这一件事：写入或更新 {checkpoint}（必须用这个绝对路径），"
+        "内容包括（1）已完成的事项，（2）改到一半的文件与所处状态，（3）恢复工作的第一条命令，"
+        f"（4）剩余待办清单，（5）不许越出的范围。同时向 {progress}（绝对路径）追加一行 "
+        '{"phase":"checkpoint"}。不要做任何其他修改，写完立即回复 checkpoint-done。'
+    )
 
 
 def cmd_ccr(args):
@@ -1690,11 +1767,14 @@ def cmd_ccr(args):
     else:
         print("1/4 run already terminal")
 
-    print("2/4 writing checkpoint (short resumed turn)...")
+    checkpoint_target = Path(old_cfg.get("cwd", "")) / "CHECKPOINT.md"
+    print(f"2/4 writing checkpoint (short resumed turn) -> {checkpoint_target}")
     cfg = dict(old_cfg)
     cfg.update({"run_id": new_run_id(), "resume_id": session_id, "fork_from": None,
                 "created_at": utcnow_iso()})
-    launch(cfg, args.checkpoint_prompt or DEFAULT_CHECKPOINT_PROMPT, wait=True, quiet=True)
+    launch(cfg, args.checkpoint_prompt or make_checkpoint_prompt(
+        old_cfg.get("cwd", ""), old_cfg.get("progress_file") or ".codex-progress.jsonl"),
+        wait=True, quiet=True)
 
     print("3/4 compacting...")
     if not run_compaction(session_id, args.timeout):
