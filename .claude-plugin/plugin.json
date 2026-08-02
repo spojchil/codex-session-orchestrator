@@ -1,0 +1,13 @@
+{
+  "name": "codex-session-orchestrator",
+  "version": "1.0.0",
+  "description": "Drive the local Codex CLI as a persistent background agent: instant dispatch with live structured state, mid-run steering, reliable process-tree cancel, proactive context compaction, and cross-session transcript search.",
+  "author": {
+    "name": "spojchil",
+    "url": "https://github.com/spojchil"
+  },
+  "homepage": "https://github.com/spojchil/codex-session-orchestrator",
+  "repository": "https://github.com/spojchil/codex-session-orchestrator",
+  "license": "MIT",
+  "keywords": ["codex", "orchestration", "agent", "dispatch", "windows"]
+}

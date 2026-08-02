@@ -1,0 +1,14 @@
+{
+  "name": "spojchil-skills",
+  "owner": {
+    "name": "spojchil",
+    "url": "https://github.com/spojchil"
+  },
+  "plugins": [
+    {
+      "name": "codex-session-orchestrator",
+      "source": "./",
+      "description": "Drive the local Codex CLI as a persistent background agent: instant dispatch with live structured state, mid-run steering, reliable process-tree cancel, proactive context compaction, and cross-session transcript search."
+    }
+  ]
+}
