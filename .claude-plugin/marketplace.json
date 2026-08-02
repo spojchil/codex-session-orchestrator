@@ -1,5 +1,6 @@
 {
   "name": "spojchil-skills",
+  "description": "Skills by spojchil — currently: codex-session-orchestrator, a background-agent orchestrator for the local Codex CLI.",
   "owner": {
     "name": "spojchil",
     "url": "https://github.com/spojchil"
