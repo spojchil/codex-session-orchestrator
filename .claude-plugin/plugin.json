@@ -1,6 +1,6 @@
 {
   "name": "codex-session-orchestrator",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "A supervision runtime for the local Codex CLI — beyond a bridge: detached supervisor with a live structured state file (phase, current command, plan progress, context-window occupancy), mid-run steering at tool-call boundaries, Job Object process-tree control with perf accounting, forced context compaction, health guards, and cross-session transcript search.",
   "author": {
     "name": "spojchil",

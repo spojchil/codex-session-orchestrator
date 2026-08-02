@@ -161,6 +161,34 @@ python .../codexctl.py fork <session-id>                  # 只分叉不执行�
 codex delete --force <fork-id>     # 会话文件与索引一起删干净
 ```
 
+## 第三方端点与多配置（profile）
+
+Codex 原生支持多配置文件：`$CODEX_HOME/<名字>.config.toml` 会叠加在基础 `config.toml`
+之上，派发时加 `--profile <名字>` 选用（`dispatch` / `resume` 都透传这个参数）。
+接第三方 OpenAI 兼容端点就用它：
+
+```toml
+# ~/.codex/third.config.toml
+model = "your-model-name"
+model_provider = "myproxy"
+
+[model_providers.myproxy]
+name = "my proxy"
+base_url = "https://api.example.com/v1"
+env_key = "MYPROXY_API_KEY"   # key 从这个环境变量读取
+wire_api = "chat"             # 端点只兼容 chat completions 就填 chat，否则 responses
+```
+
+```bash
+export MYPROXY_API_KEY=sk-xxx
+python <技能目录>/scripts/codexctl.py dispatch --profile third -C <项目> "任务"
+```
+
+API key 只走环境变量：沿派发链自然继承到 codex 进程，不进状态文件、事件日志或命令行。
+
+**一条会话线从头到尾用同一个 profile。**会话按线记录 provider，换 provider 去 resume
+同一条会话的兼容性未验证；要换端点就开新会话。
+
 ## 会话考古与检索：codex-trace
 
 ```bash
