@@ -62,9 +62,26 @@ def utcnow_iso() -> str:
 
 
 def atomic_write_json(path: Path, data) -> None:
-    tmp = path.with_suffix(path.suffix + ".tmp")
+    """Unique temp name + retried replace. On Windows, os.replace fails with WinError 5
+    for as long as any reader (a status poll, an indexer) holds the destination open —
+    Python readers don't pass FILE_SHARE_DELETE — so a fixed temp name and a single
+    attempt took the whole supervisor down. Observed in production three times."""
+    tmp = path.with_name(f"{path.name}.{os.getpid()}-{secrets.token_hex(3)}.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-    os.replace(tmp, path)
+    delay = 0.01
+    for attempt in range(8):
+        try:
+            os.replace(tmp, path)
+            return
+        except OSError:
+            if attempt == 7:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, 0.2)
 
 
 def read_json(path: Path, default=None):
@@ -402,6 +419,8 @@ class Supervisor:
         self.alerted = set()
         self.rollout_path = None
         self.rollout_offset = 0
+        self.last_activity_mono = time.monotonic()
+        self.progress_offset = 0
         self.job = None
         self.proc = None
         self.saw_turn_complete = False
@@ -418,8 +437,14 @@ class Supervisor:
         if not force and (not self.dirty or now - self.last_flush < 0.5):
             return
         self.state["updated_at"] = utcnow_iso()
-        atomic_write_json(self.state_path, self.state)
-        self.dirty = False
+        try:
+            atomic_write_json(self.state_path, self.state)
+            self.dirty = False
+        except OSError as exc:
+            # A state-write failure must never end the supervisor: its death closes the
+            # Job Object handle, and KILL_ON_JOB_CLOSE takes the codex tree down with it.
+            # Leave dirty set; the next tick retries.
+            print(f"state flush failed, will retry: {exc}", file=sys.stderr, flush=True)
         self.last_flush = now
 
     def alert(self, rule: str, message: str, act=True):
@@ -613,8 +638,38 @@ class Supervisor:
                                f"context {tokens['context_used_pct']}% of {window}")
             self.dirty = True
 
+    def tail_progress(self):
+        """Agent-side reporting: the task brief may ask codex to append JSON lines to a
+        progress file in its workspace. Append-only; a report resets the stall timer so a
+        long quiet command with live reports is not misread as a hang. Semantic garnish
+        only — never the sole liveness signal."""
+        path = Path(self.cfg["cwd"]) / (self.cfg.get("progress_file") or ".codex-progress.jsonl")
+        try:
+            if path.stat().st_size <= self.progress_offset:
+                return
+            with path.open("r", encoding="utf-8", errors="replace") as f:
+                f.seek(self.progress_offset)
+                chunk = f.read()
+                self.progress_offset = f.tell()
+        except OSError:
+            return
+        for raw in chunk.splitlines():
+            raw = raw.strip()
+            if not raw:
+                continue
+            try:
+                obj = json.loads(raw)
+            except json.JSONDecodeError:
+                obj = {"note": trim(raw, 200)}
+            report = self.state.setdefault("agent_report", {})
+            report["last"] = obj
+            report["count"] = report.get("count", 0) + 1
+            report["at"] = utcnow_iso()
+            self.last_activity_mono = time.monotonic()
+            self.dirty = True
+
     def health_tick(self):
-        silence = time.monotonic() - self.last_event_mono
+        silence = time.monotonic() - max(self.last_event_mono, self.last_activity_mono)
         self.set(silence_seconds=round(silence))
         max_silence = self.cfg.get("max_silence", 600)
         if max_silence and silence > max_silence:
@@ -744,6 +799,8 @@ class Supervisor:
         stream_done = False
         last_ctl_tick = 0.0
         last_slow_tick = 0.0
+        # Nothing inside this loop may raise: an unexpected supervisor death closes the
+        # Job Object handle and KILL_ON_JOB_CLOSE kills the working codex tree with it.
         while not stream_done:
             try:
                 entry = events.get(timeout=0.5)
@@ -763,22 +820,40 @@ class Supervisor:
                         append_jsonl(self.events_path, {"ts": ts, "raw": line})
             except queue.Empty:
                 pass
+            except Exception as exc:
+                print(f"event handling error, skipped: {exc!r}", file=sys.stderr, flush=True)
 
-            now = time.monotonic()
-            if now - last_ctl_tick >= 1:
-                last_ctl_tick = now
-                self.control_tick()
-            if now - last_slow_tick >= 5:
-                last_slow_tick = now
-                self.tail_rollout()
-                self.health_tick()
-                self.perf_tick()
-            self.maybe_terminate()
-            self.flush()
+            try:
+                now = time.monotonic()
+                if now - last_ctl_tick >= 1:
+                    last_ctl_tick = now
+                    self.control_tick()
+                if now - last_slow_tick >= 5:
+                    last_slow_tick = now
+                    self.tail_rollout()
+                    self.tail_progress()
+                    self.health_tick()
+                    self.perf_tick()
+                self.maybe_terminate()
+                self.flush()
+            except Exception as exc:
+                print(f"tick error, skipped: {exc!r}", file=sys.stderr, flush=True)
 
         exit_code = self.proc.wait()
         stderr_log.close()
-        self.finalize(exit_code, last_message)
+        try:
+            self.finalize(exit_code, last_message)
+        except Exception as exc:
+            print(f"finalize error: {exc!r}", file=sys.stderr, flush=True)
+            try:
+                atomic_write_json(self.run_dir / "result.json", {
+                    "run_id": self.cfg.get("run_id"), "phase": "failed",
+                    "reason": f"finalize error: {exc}", "exit_code": exit_code,
+                    "finished_at": utcnow_iso(),
+                    "session_id": self.state.get("session_id"),
+                })
+            except OSError:
+                pass
         return 0
 
     def finalize(self, exit_code: int, last_message: Path):
@@ -838,6 +913,8 @@ def shared_dispatch_flags(p: argparse.ArgumentParser):
     p.add_argument("--context-alert-pct", type=int, default=90)
     p.add_argument("--on-alert", choices=["warn", "cancel"], default="warn",
                    help="cancel = auto soft-cancel when any health rule fires.")
+    p.add_argument("--progress-file", default=".codex-progress.jsonl", metavar="NAME",
+                   help="Workspace-relative file the agent may append progress reports to.")
     p.add_argument("--wait", action="store_true", help="Block until the run finishes.")
 
 
@@ -868,6 +945,7 @@ def cfg_from_args(args, resume_id=None, fork_from=None) -> dict:
         "allowed_paths": args.allowed_path,
         "context_alert_pct": args.context_alert_pct,
         "on_alert": args.on_alert,
+        "progress_file": args.progress_file,
         "created_at": utcnow_iso(),
     }
 
@@ -979,6 +1057,11 @@ def render_status(run_dir: Path, as_json=False):
         for item in progress.get("items", [])[:6]:
             mark = "x" if item["completed"] else " "
             print(f"            [{mark}] {item['text']}")
+    report = state.get("agent_report")
+    if report and report.get("last"):
+        last = report["last"]
+        parts = [f"{k}={trim(str(v), 60)}" for k, v in list(last.items())[:4]]
+        print(f"report:   {'  '.join(parts)}  ({report.get('count', 0)} reports)")
     tokens = state.get("tokens") or {}
     total = tokens.get("total") or {}
     if total:
