@@ -117,6 +117,13 @@ def resolve_run_dir(token: str) -> Path:
     if len(matches) == 1:
         return matches[0]
     if not matches:
+        # A session id resolves to that session's CURRENT run via the index.
+        index = read_json(orch_home() / "sessions.json") or {}
+        for sid, meta in index.items():
+            if sid.startswith(token) or token in sid:
+                current = meta.get("current_run_id")
+                if current and (root / current).exists():
+                    return root / current
         raise SystemExit(f"no run matches: {token}")
     raise SystemExit(f"ambiguous run id {token}: " + ", ".join(p.name for p in matches[:5]))
 
@@ -417,8 +424,10 @@ class Supervisor:
         self.cancel_req = None
         self.control_seen = 0.0
         self.alerted = set()
+        self.health_current = {}
         self.rollout_path = None
         self.rollout_offset = 0
+        self.rollout_mtime = 0.0
         self.last_activity_mono = time.monotonic()
         self.progress_offset = 0
         self.job = None
@@ -447,18 +456,50 @@ class Supervisor:
             print(f"state flush failed, will retry: {exc}", file=sys.stderr, flush=True)
         self.last_flush = now
 
-    def alert(self, rule: str, message: str, act=True):
+    # Health has two kinds of entries. Condition rules (context_high, stalled, no_diff,
+    # max_items, max_runtime) are re-evaluated every tick and AUTO-RESOLVE when the
+    # condition clears — a compaction that brings context back down removes the alert
+    # instead of leaving a stale warning. Point rules (path_violation, repeat_command)
+    # are real violations and stay visible for the rest of the run.
+
+    def _on_alert_action(self, rule: str):
+        if self.cfg.get("on_alert") == "cancel" and not self.cancel_req:
+            self.request_cancel(grace=20, reason=f"auto: {rule}")
+
+    def _publish_health(self, history_record=None):
+        health = self.state.setdefault("health", {"status": "ok", "current": [], "history": []})
+        if history_record:
+            health["history"] = (health.get("history") or [])[-19:] + [history_record]
+        health["current"] = list(self.health_current.values())
+        health["status"] = "warning" if health["current"] else "ok"
+        self.dirty = True
+
+    def point_alert(self, rule: str, message: str):
         if rule in self.alerted:
             return
         self.alerted.add(rule)
-        record = {"ts": utcnow_iso(), "rule": rule, "message": message}
+        record = {"ts": utcnow_iso(), "rule": rule, "message": message, "kind": "event"}
         append_jsonl(self.alerts_path, record)
-        health = self.state.setdefault("health", {"status": "ok", "alerts": []})
-        health["status"] = "warning"
-        health["alerts"] = (health.get("alerts") or [])[-9:] + [record]
-        self.dirty = True
-        if act and self.cfg.get("on_alert") == "cancel" and not self.cancel_req:
-            self.request_cancel(grace=self.cfg.get("cancel_grace", 20), reason=f"auto: {rule}")
+        self.health_current[rule] = {"rule": rule, "message": message, "since": record["ts"]}
+        self._publish_health(record)
+        self._on_alert_action(rule)
+
+    def eval_condition(self, rule: str, active: bool, message: str):
+        held = rule in self.health_current
+        if active and not held:
+            record = {"ts": utcnow_iso(), "rule": rule, "message": message, "kind": "condition"}
+            append_jsonl(self.alerts_path, record)
+            self.health_current[rule] = {"rule": rule, "message": message, "since": record["ts"]}
+            self._publish_health(record)
+            self._on_alert_action(rule)
+        elif active and held:
+            self.health_current[rule]["message"] = message
+            self._publish_health()
+        elif not active and held:
+            self.health_current.pop(rule, None)
+            record = {"ts": utcnow_iso(), "rule": rule, "resolved": True}
+            append_jsonl(self.alerts_path, record)
+            self._publish_health(record)
 
     def request_cancel(self, grace: int, reason: str):
         self.cancel_req = {"deadline": time.monotonic() + max(0, grace), "reason": reason}
@@ -578,7 +619,7 @@ class Supervisor:
         for base in allowed:
             if resolved.startswith(str(Path(base).resolve()).lower()):
                 return
-        self.alert("path_violation", f"file change outside allowed paths: {path}")
+        self.point_alert("path_violation", f"file change outside allowed paths: {path}")
 
     def check_repeat_reads(self, command: str):
         limit = self.cfg.get("max_repeat_command", 0)
@@ -588,7 +629,7 @@ class Supervisor:
         key = trim(command, 160)
         seen[key] = seen.get(key, 0) + 1
         if seen[key] >= limit:
-            self.alert("repeat_command", f"same command ran {seen[key]}x: {key}")
+            self.point_alert("repeat_command", f"same command ran {seen[key]}x: {key}")
         if len(seen) > 400:
             seen.clear()
 
@@ -603,6 +644,18 @@ class Supervisor:
         if not self.rollout_path:
             self.rollout_path = None if self.rollout_path is False else self.rollout_path
             return
+        try:
+            mtime = Path(self.rollout_path).stat().st_mtime
+        except OSError:
+            return
+        if mtime > self.rollout_mtime:
+            # The session file advancing is remote-stream activity even when the --json
+            # channel is quiet (long reasoning between items) — count it against the
+            # stall timer. Partial signal only: a single long model request can keep
+            # both channels silent until its first item completes.
+            self.rollout_mtime = mtime
+            self.last_activity_mono = time.monotonic()
+            self.set(remote_stream={"last_write_epoch": round(mtime, 1)})
         try:
             with open(self.rollout_path, "r", encoding="utf-8", errors="replace") as f:
                 f.seek(self.rollout_offset)
@@ -633,9 +686,6 @@ class Supervisor:
                 tokens["context_window"] = window
                 used = last.get("input_tokens") or 0
                 tokens["context_used_pct"] = round(used * 100 / window, 1)
-                if tokens["context_used_pct"] >= self.cfg.get("context_alert_pct", 90):
-                    self.alert("context_high",
-                               f"context {tokens['context_used_pct']}% of {window}")
             self.dirty = True
 
     def tail_progress(self):
@@ -672,18 +722,27 @@ class Supervisor:
         silence = time.monotonic() - max(self.last_event_mono, self.last_activity_mono)
         self.set(silence_seconds=round(silence))
         max_silence = self.cfg.get("max_silence", 600)
-        if max_silence and silence > max_silence:
-            self.alert("stalled", f"no codex events for {fmt_secs(silence)}")
-        limit = self.cfg.get("max_commands_no_diff", 0)
+        if max_silence:
+            self.eval_condition("stalled", silence > max_silence,
+                                f"no events/activity for {fmt_secs(silence)}")
         counts = self.state.get("counts") or {}
-        if limit and counts.get("commands_since_diff", 0) > limit:
-            self.alert("no_diff", f"{counts['commands_since_diff']} commands without a file change")
+        limit = self.cfg.get("max_commands_no_diff", 0)
+        if limit:
+            n = counts.get("commands_since_diff", 0)
+            self.eval_condition("no_diff", n > limit, f"{n} commands without a file change")
         max_items = self.cfg.get("max_items", 0)
-        if max_items and counts.get("items", 0) > max_items:
-            self.alert("max_items", f"item count exceeded {max_items}")
+        if max_items:
+            self.eval_condition("max_items", counts.get("items", 0) > max_items,
+                                f"item count exceeded {max_items}")
         max_runtime = self.cfg.get("max_runtime", 0)
-        if max_runtime and time.monotonic() - self.t0 > max_runtime:
-            self.alert("max_runtime", f"runtime exceeded {fmt_secs(max_runtime)}")
+        if max_runtime:
+            self.eval_condition("max_runtime", time.monotonic() - self.t0 > max_runtime,
+                                f"runtime exceeded {fmt_secs(max_runtime)}")
+        pct = (self.state.get("tokens") or {}).get("context_used_pct")
+        if pct is not None:
+            threshold = self.cfg.get("context_alert_pct", 90)
+            self.eval_condition("context_high", pct >= threshold,
+                                f"context {pct}% (threshold {threshold}%)")
 
     def perf_tick(self):
         if self.job is None:
@@ -754,7 +813,12 @@ class Supervisor:
         self.t0 = time.monotonic()
         self.set(run_id=run_id, phase="starting", cwd=cfg["cwd"], baseline_commit=baseline,
                  started_at=utcnow_iso(), supervisor_pid=os.getpid(), cmd=cmd,
-                 engine="exec", health={"status": "ok", "alerts": []})
+                 engine="exec", health={"status": "ok", "current": [], "history": []},
+                 cli_entrypoint=f'python "{SELF}"')
+        if cfg.get("allowed_paths"):
+            # Normalized at dispatch; shown here so a misconfigured guard is visible
+            # instead of silently firing.
+            self.set(allowed_paths=cfg["allowed_paths"])
         self.flush(force=True)
 
         if IS_WIN:
@@ -859,6 +923,9 @@ class Supervisor:
     def finalize(self, exit_code: int, last_message: Path):
         self.tail_rollout()
         self.snapshot_git()
+        # The run is over: whatever conditions were active are no longer "current".
+        for rule in list(self.health_current):
+            self.eval_condition(rule, False, "")
         if self.state.get("phase") == "cancelled":
             phase, reason = "cancelled", self.state.get("cancel_requested") or "cancelled"
         elif self.turn_failed_error:
@@ -915,6 +982,8 @@ def shared_dispatch_flags(p: argparse.ArgumentParser):
                    help="cancel = auto soft-cancel when any health rule fires.")
     p.add_argument("--progress-file", default=".codex-progress.jsonl", metavar="NAME",
                    help="Workspace-relative file the agent may append progress reports to.")
+    p.add_argument("--prompt-file", metavar="PATH",
+                   help="Read the prompt from a file (wins over the positional prompt).")
     p.add_argument("--wait", action="store_true", help="Block until the run finishes.")
 
 
@@ -942,12 +1011,53 @@ def cfg_from_args(args, resume_id=None, fork_from=None) -> dict:
         "max_items": args.max_items,
         "max_runtime": args.max_runtime,
         "max_repeat_command": args.max_repeat_command,
-        "allowed_paths": args.allowed_path,
+        # Anchor relative allowed roots to the project dir at dispatch time. The
+        # supervisor runs with the run directory as cwd, so resolving there made every
+        # relative root a guaranteed (false) path_violation.
+        "allowed_paths": [
+            str((Path(p) if Path(p).is_absolute() else project_dir / p).resolve())
+            for p in args.allowed_path],
         "context_alert_pct": args.context_alert_pct,
         "on_alert": args.on_alert,
         "progress_file": args.progress_file,
         "created_at": utcnow_iso(),
     }
+
+
+def resolve_prompt(args) -> str:
+    if getattr(args, "prompt_file", None):
+        return Path(args.prompt_file).read_text(encoding="utf-8")
+    if args.prompt is not None:
+        return args.prompt
+    return sys.stdin.read()
+
+
+def sessions_index_path() -> Path:
+    return orch_home() / "sessions.json"
+
+
+def update_session_index(session_id: str, run_id: str):
+    """Keeps session -> current_run_id, and stamps the superseded run so stale monitors
+    can see they are watching an old state file."""
+    if not session_id:
+        return
+    index = read_json(sessions_index_path()) or {}
+    prev = (index.get(session_id) or {}).get("current_run_id")
+    if prev and prev != run_id:
+        prev_dir = runs_root() / prev
+        prev_state = read_json(prev_dir / "state.json")
+        if prev_state and prev_state.get("phase") in TERMINAL_PHASES \
+                and prev_state.get("superseded_by") != run_id:
+            prev_state["superseded_by"] = run_id
+            try:
+                atomic_write_json(prev_dir / "state.json", prev_state)
+            except OSError:
+                pass
+    index[session_id] = {"current_run_id": run_id, "updated_at": utcnow_iso()}
+    try:
+        atomic_write_json(sessions_index_path(), index)
+    except OSError:
+        pass
 
 
 def spawn_supervisor(run_dir: Path):
@@ -984,6 +1094,8 @@ def launch(cfg: dict, prompt: str, wait: bool, quiet: bool = False) -> dict:
             break
         time.sleep(0.3)
 
+    update_session_index(state.get("session_id") or cfg.get("resume_id"), cfg["run_id"])
+
     if not quiet:
         print(f"run_id: {cfg['run_id']}")
         print(f"session_id: {state.get('session_id') or ''}")
@@ -994,9 +1106,11 @@ def launch(cfg: dict, prompt: str, wait: bool, quiet: bool = False) -> dict:
         # writes result.json — wait for the result, with a grace window in case the
         # supervisor died mid-finalize.
         terminal_seen = None
+        result = None
         while True:
             state = read_json(state_path) or {}
-            if read_json(run_dir / "result.json"):
+            result = read_json(run_dir / "result.json")
+            if result:
                 break
             if state.get("phase") in TERMINAL_PHASES:
                 terminal_seen = terminal_seen or time.time()
@@ -1008,14 +1122,16 @@ def launch(cfg: dict, prompt: str, wait: bool, quiet: bool = False) -> dict:
             print()
         if final.exists():
             print(final.read_text(encoding="utf-8", errors="replace").rstrip())
-        result = read_json(run_dir / "result.json") or {}
+        # Reuse the read that broke the loop: re-reading can hit the atomic-replace
+        # window and momentarily see nothing.
+        result = result or read_json(run_dir / "result.json") or {}
         if result.get("phase") != "completed":
             print(f"[{result.get('phase')}] {result.get('reason')}", file=sys.stderr)
     return state
 
 
 def cmd_dispatch(args):
-    prompt = args.prompt if args.prompt is not None else sys.stdin.read()
+    prompt = resolve_prompt(args)
     if not prompt.strip():
         raise SystemExit("prompt is empty")
     if args.session_id and args.fork_from:
@@ -1025,7 +1141,7 @@ def cmd_dispatch(args):
 
 
 def cmd_resume(args):
-    prompt = args.prompt if args.prompt is not None else sys.stdin.read()
+    prompt = resolve_prompt(args)
     if not prompt.strip():
         raise SystemExit("prompt is empty")
     cfg = cfg_from_args(args, resume_id=args.session_id)
@@ -1077,13 +1193,21 @@ def render_status(run_dir: Path, as_json=False):
     files = state.get("files_changed") or {}
     if files:
         print(f"files:    {len(files)} changed  {state.get('diff_stat') or ''}")
+    rs = state.get("remote_stream") or {}
+    if live and rs.get("last_write_epoch"):
+        print(f"stream:   session file written {fmt_secs(max(0, time.time() - rs['last_write_epoch']))} ago")
     health = state.get("health") or {}
-    if health.get("alerts"):
-        print(f"health:   {health.get('status')}")
-        for alert in health["alerts"][-3:]:
-            print(f"            ! {alert['rule']}: {alert['message']}")
+    current = health.get("current")
+    if current:
+        print(f"health:   warning ({len(current)} active)")
+        for alert in current[:4]:
+            print(f"            ! {alert['rule']}: {alert['message']}"
+                  f"  (since {(alert.get('since') or '')[11:19]})")
     else:
-        print("health:   ok")
+        history = health.get("history") or health.get("alerts") or []
+        print("health:   ok" + (f"  ({len(history)} past alerts, resolved)" if history else ""))
+    if state.get("superseded_by"):
+        print(f"note:     superseded by {state['superseded_by']} (this is an old run of the session)")
     perf = state.get("perf") or {}
     if perf:
         print(f"perf:     cpu {perf.get('cpu_seconds', 0)}s"
@@ -1102,8 +1226,40 @@ def render_status(run_dir: Path, as_json=False):
               f"{', '.join(state['unknown_events'])}")
 
 
+def git_snapshot(cwd: str, baseline: str):
+    """On-demand only — the supervisor never polls git; this runs once when asked."""
+    def g(*argv):
+        try:
+            out = subprocess.run(["git", "-C", cwd, *argv], capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace", timeout=15,
+                                 creationflags=NO_WINDOW)
+            return out.stdout.strip() if out.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    ref = baseline or "HEAD"
+    print("--- git (on demand) ---")
+    stat = g("diff", "--shortstat", ref)
+    print(f"vs {ref}: {stat or 'no diff (or not a git repo)'}")
+    names = g("diff", "--name-status", ref)
+    if names:
+        lines = names.splitlines()
+        for line in lines[:12]:
+            print(f"  {line}")
+        if len(lines) > 12:
+            print(f"  ... {len(lines) - 12} more files")
+    porcelain = g("status", "--porcelain")
+    if porcelain is not None:
+        print(f"uncommitted entries: {len(porcelain.splitlines()) if porcelain else 0}")
+
+
 def cmd_status(args):
-    render_status(resolve_run_dir(args.run), as_json=args.json)
+    run_dir = resolve_run_dir(args.run)
+    render_status(run_dir, as_json=args.json)
+    if args.diff and not args.json:
+        state = read_json(run_dir / "state.json") or {}
+        if state.get("cwd"):
+            git_snapshot(state["cwd"], state.get("baseline_commit"))
 
 
 def cmd_watch(args):
@@ -1265,38 +1421,53 @@ def cmd_cancel(args):
         hard_kill(run_dir)
 
 
-def cmd_steer(args):
-    """Mid-run course correction: stop at an item boundary, then resume with the new prompt.
+def stop_run(run_dir: Path, grace: int, reason: str) -> dict:
+    """Stops a live run at an item boundary (grace, then force) and returns its final state."""
+    state = read_json(run_dir / "state.json") or {}
+    if state.get("phase") in TERMINAL_PHASES:
+        return state
+    if request_supervisor_cancel(run_dir, grace, reason):
+        state = wait_terminal(run_dir, grace + 30)
+        if state.get("phase") not in TERMINAL_PHASES:
+            hard_kill(run_dir)
+            state = wait_terminal(run_dir, 10)
+    else:
+        # Dead supervisor: record the terminal state ourselves so the old run never
+        # reads as still running.
+        hard_kill(run_dir)
+        state = read_json(run_dir / "state.json") or {}
+        state.update({"phase": "cancelled",
+                      "cancel_requested": f"{reason} (supervisor was gone)"})
+        atomic_write_json(run_dir / "state.json", state)
+    return state
 
-    Killing was never the goal — injecting a new prompt was. The context up to the stop is
-    preserved in the session, so the resumed run continues with the correction applied.
-    """
+
+def cmd_steer(args):
+    """Interrupt-and-resume, by design: `codex exec` has no input channel to a running
+    process, so steering means stopping at an item boundary and resuming the SAME
+    session with the correction. Context up to the stop is fully preserved."""
     run_dir = resolve_run_dir(args.run)
     state = read_json(run_dir / "state.json") or {}
     old_cfg = read_json(run_dir / "run.json") or {}
     session_id = state.get("session_id")
     if not session_id:
         raise SystemExit("run has no session_id yet; try again in a few seconds or cancel it")
+    prompt = resolve_prompt(args)
+    if not prompt.strip():
+        raise SystemExit("prompt is empty")
 
-    if state.get("phase") not in TERMINAL_PHASES:
-        if request_supervisor_cancel(run_dir, args.grace, "steer"):
-            state = wait_terminal(run_dir, args.grace + 30)
-            if state.get("phase") not in TERMINAL_PHASES:
-                hard_kill(run_dir)
-                wait_terminal(run_dir, 10)
-        else:
-            # Dead supervisor: record the terminal state ourselves, before moving on, so the
-            # old run never reads as still running.
-            hard_kill(run_dir)
-            state = read_json(run_dir / "state.json") or {}
-            state.update({"phase": "cancelled", "cancel_requested": "steer (supervisor was gone)"})
-            atomic_write_json(run_dir / "state.json", state)
-        print(f"stopped {run_dir.name}")
+    state = stop_run(run_dir, args.grace, "steer")
+    print(f"stopped {run_dir.name}")
 
     cfg = dict(old_cfg)
     cfg.update({"run_id": new_run_id(), "resume_id": session_id, "fork_from": None,
                 "created_at": utcnow_iso(), "steered_from": run_dir.name})
-    launch(cfg, args.prompt, wait=args.wait)
+    launch(cfg, prompt, wait=args.wait)
+    print(json.dumps({"steer": {
+        "old_run": run_dir.name, "new_run": cfg["run_id"], "session_id": session_id,
+        "boundary": state.get("cancel_boundary"),
+        "mode": "interrupt-and-resume",
+    }}, ensure_ascii=False))
 
 
 def cmd_events(args):
@@ -1457,44 +1628,89 @@ def rollout_compaction_count(session_id: str) -> int:
     return count
 
 
-def cmd_compact(args):
-    session_id = args.session_id
+def run_compaction(session_id: str, timeout: int) -> bool:
+    """Compacts a session via app-server; True only when the compaction is confirmed
+    (contextCompaction item completed, or the rollout gained a context_compacted event)."""
     before = rollout_compaction_count(session_id)
     client = AppServerClient()
     try:
-        client.call("initialize", {
-            "clientInfo": {"name": "codexctl", "title": "codexctl", "version": "2.0"},
-            "capabilities": {"experimentalApi": True},
-        }, timeout=30)
-        client.notify("initialized")
+        appserver_session(client)
         client.call("thread/resume", {"threadId": session_id}, timeout=60)
         client.call("thread/compact/start", {"threadId": session_id}, timeout=60)
-        print("compaction started; waiting", end="", flush=True)
-        deadline = time.time() + args.timeout
-        done = False
+        deadline = time.time() + timeout
         while time.time() < deadline:
             for note in client.take_notifications():
                 params = note.get("params") or {}
                 item = params.get("item") or {}
                 if note.get("method") == "item/completed" \
                         and item.get("type") == "contextCompaction":
-                    done = True
+                    return True
                 if note.get("method") == "error":
                     err = (params.get("error") or {}).get("message")
-                    print(f"\n  transient: {err}", flush=True)
-            if done or rollout_compaction_count(session_id) > before:
-                done = True
-                break
-            print(".", end="", flush=True)
+                    print(f"  transient: {err}", flush=True)
+            if rollout_compaction_count(session_id) > before:
+                return True
             time.sleep(3)
-        print()
-        if done:
-            print(f"compacted OK  (rollout context_compacted events: "
-                  f"{rollout_compaction_count(session_id)})")
-        else:
-            raise SystemExit("timed out waiting for compaction; check the session manually")
+        return False
     finally:
         client.close()
+
+
+def cmd_compact(args):
+    print("compaction started; waiting...")
+    if run_compaction(args.session_id, args.timeout):
+        print(f"compacted OK  (rollout context_compacted events: "
+              f"{rollout_compaction_count(args.session_id)})")
+    else:
+        raise SystemExit("timed out waiting for compaction; check the session manually")
+
+
+DEFAULT_CHECKPOINT_PROMPT = (
+    "把当前进度写成 checkpoint，只做这一件事：在工作区根写入或更新 CHECKPOINT.md，内容包括"
+    "（1）已完成的事项，（2）改到一半的文件与所处状态，（3）恢复工作的第一条命令，"
+    "（4）剩余待办清单，（5）不许越出的范围。同时向 .codex-progress.jsonl 追加一行 "
+    '{"phase":"checkpoint"}。不要做任何其他修改，写完立即回复 checkpoint-done。'
+)
+
+
+def cmd_ccr(args):
+    """Checkpoint -> compact -> resume as one transaction. Aborts before the resume step
+    if compaction cannot be confirmed, leaving the session unchanged."""
+    run_dir = resolve_run_dir(args.run)
+    state = read_json(run_dir / "state.json") or {}
+    session_id = state.get("session_id")
+    if not session_id:
+        raise SystemExit("run has no session_id")
+    continuation = Path(args.prompt_file).read_text(encoding="utf-8")
+    old_cfg = read_json(run_dir / "run.json") or {}
+
+    if state.get("phase") not in TERMINAL_PHASES:
+        print("1/4 stopping at item boundary...")
+        stop_run(run_dir, args.grace, "checkpoint-compact-resume")
+    else:
+        print("1/4 run already terminal")
+
+    print("2/4 writing checkpoint (short resumed turn)...")
+    cfg = dict(old_cfg)
+    cfg.update({"run_id": new_run_id(), "resume_id": session_id, "fork_from": None,
+                "created_at": utcnow_iso()})
+    launch(cfg, args.checkpoint_prompt or DEFAULT_CHECKPOINT_PROMPT, wait=True, quiet=True)
+
+    print("3/4 compacting...")
+    if not run_compaction(session_id, args.timeout):
+        raise SystemExit(
+            "compaction not confirmed; ABORTING before resume — session and checkpoint "
+            "are intact, retry with a longer --timeout")
+    print(f"    compacted OK (events: {rollout_compaction_count(session_id)})")
+
+    print("4/4 resuming with continuation prompt...")
+    cfg = dict(old_cfg)
+    cfg.update({"run_id": new_run_id(), "resume_id": session_id, "fork_from": None,
+                "created_at": utcnow_iso(), "steered_from": run_dir.name})
+    launch(cfg, continuation, wait=args.wait)
+    print(json.dumps({"checkpoint_compact_resume": {
+        "old_run": run_dir.name, "new_run": cfg["run_id"], "session_id": session_id,
+    }}, ensure_ascii=False))
 
 
 # ---------------------------------------------------------------------------- entry point
@@ -1525,9 +1741,11 @@ def main():
     shared_dispatch_flags(p)
     p.set_defaults(func=cmd_resume)
 
-    p = sub.add_parser("status", help="Show a run's current state.")
+    p = sub.add_parser("status", help="Show a run's current state (run id, prefix, or session id).")
     p.add_argument("run", nargs="?", default="latest")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--diff", action="store_true",
+                   help="Also take a one-shot git snapshot of the workspace (on demand only).")
     p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("watch", help="Live-refresh a run's state until it finishes.")
@@ -1547,12 +1765,27 @@ def main():
     p.add_argument("--hard", action="store_true", help="Kill the tree immediately.")
     p.set_defaults(func=cmd_cancel)
 
-    p = sub.add_parser("steer", help="Stop a run at a boundary and resume it with a new prompt.")
+    p = sub.add_parser("steer",
+                       help="Interrupt-and-resume: stop at an item boundary, resume the "
+                            "same session with a correction prompt.")
     p.add_argument("run")
-    p.add_argument("prompt")
+    p.add_argument("prompt", nargs="?")
+    p.add_argument("--prompt-file", metavar="PATH")
     p.add_argument("--grace", type=int, default=20)
     p.add_argument("--wait", action="store_true")
     p.set_defaults(func=cmd_steer)
+
+    p = sub.add_parser("checkpoint-compact-resume", aliases=["ccr"],
+                       help="One transaction: checkpoint turn, compact, resume from a prompt file.")
+    p.add_argument("run")
+    p.add_argument("--prompt-file", required=True, metavar="PATH",
+                   help="Continuation prompt used for the final resume.")
+    p.add_argument("--checkpoint-prompt", metavar="TEXT",
+                   help="Override the default checkpoint-writing instruction.")
+    p.add_argument("--grace", type=int, default=20)
+    p.add_argument("--timeout", type=int, default=300, help="Compaction confirm timeout.")
+    p.add_argument("--wait", action="store_true")
+    p.set_defaults(func=cmd_ccr)
 
     p = sub.add_parser("compact", help="Force context compaction on a session (app-server).")
     p.add_argument("session_id")

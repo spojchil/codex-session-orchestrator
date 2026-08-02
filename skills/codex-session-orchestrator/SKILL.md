@@ -49,6 +49,9 @@ watch: python .../codexctl.py watch r-20250101-120000-ab12
 `--session-id <id>`（续接）、`--fork-from <id>`（复制父会话再执行，父会话不动）。
 `--wait` 为阻塞式用法（打印最终回复后才返回）。
 
+**长任务书用 `--prompt-file <路径>`**（dispatch / resume / steer 都支持）：内容含反引号、
+引号、多行 Markdown 时不再经受任何 shell 转义，先写文件再派发。
+
 健康守卫选项（超阈值写告警；`--on-alert cancel` 则自动软取消）：
 
 ```text
@@ -57,7 +60,8 @@ watch: python .../codexctl.py watch r-20250101-120000-ab12
 --max-items N              条目总数上限
 --max-runtime N            总时长上限（秒）
 --max-repeat-command N     同一命令重复 N 次
---allowed-path DIR         文件改动越出这些根目录即告警（可重复）
+--allowed-path DIR         文件改动越出这些根目录即告警（可重复；相对路径以 -C 为锚，
+                           规范化结果写在 state.json 的 allowed_paths 里）
 --context-alert-pct 90     上下文占用百分比告警线
 --on-alert warn|cancel     告警后动作（默认 warn）
 ```
@@ -80,11 +84,24 @@ python .../codexctl.py list -C           # 只看当前目录工作区的（-C <
 `status` 一屏包含：阶段（requesting_model / reasoning / running_tool / completed / failed /
 cancelled）、正在执行的命令、计划完成度（Codex 自己维护的 todo list）、token 用量与
 **上下文占用百分比**、改动文件（来自事件流）、健康告警、进程树 CPU/IO/内存峰值。
-`--json` 输出机器可读的完整状态。
+`--json` 输出机器可读的完整状态。`status` 也接受 **session id**——自动解析到该会话
+当前最新的 run（旧 run 的状态里会有 `superseded_by` 指向接替者）。
 
-**工作树的权威状态自己跑 `git status` / `git diff --stat` 去看**（在任务的 `-C` 目录里）。
-状态文件里的改动文件来自 Codex 的补丁事件，它用命令直接写的文件不在其中；运行期间
-不做周期性 git 快照，只在任务结束时记录一次未提交改动数进 `result.json`。
+健康告警分两类：**条件类**（context_high、stalled、no_diff 等）实时重估，条件消失即自动
+resolve——压缩后上下文降回去，`context_high` 会自己消掉，`health.current` 只含当前仍
+成立的告警，历史在 `health.history`；**违规类**（越界写文件、命令重复）保留整个 run 可见。
+
+`stream:` 行显示会话文件最近写盘时间——模型长推理期间 `--json` 通道安静，但会话文件仍在
+写，它同时计入卡死计时（部分信号：单次超长请求两个通道都可能安静）。
+
+`state.json` 里的 `cli_entrypoint` 字段是本工具的完整调用前缀，编排方直接复用即可——
+**没有裸 `codexctl` 命令**，一律 `python <技能目录>/scripts/codexctl.py`。
+
+**工作树的权威状态自己跑 `git status` / `git diff --stat` 去看**（在任务的 `-C` 目录里），
+或者用 `status <run> --diff` 让工具**按需**做一次快照（相对 baseline 的增删行、文件清单、
+未提交数）——只在你要的时候跑一次，运行期间从不周期性碰 git。任务结束时会记录一次
+未提交改动数进 `result.json`。状态文件里的改动文件来自 Codex 的补丁事件，它用命令
+直接写的文件不在其中。
 
 run 目录里可直接读的文件：`state.json`（实时状态）、`result.json`（终态：退出码、原因、
 推荐 resume 命令）、`last-message.md`（最终回复）、`events.jsonl`（全部事件+时间戳）、
@@ -103,15 +120,20 @@ run 目录里可直接读的文件：`state.json`（实时状态）、`result.js
 `status` 的 `report:` 行；**每次上报会重置无事件卡死计时**，长命令的静默期不再误报
 stalled。上报是语义补充，不作为存活的唯一判据——走偏或卡住的代理可能根本不上报。
 
-## 中途改方向：steer（这就是以前"杀进程"的正确形态）
+## 中途改方向：steer（语义 = interrupt-and-resume）
 
 ```bash
-python .../codexctl.py steer <run> "纠偏提示词"
+python .../codexctl.py steer <run> "纠偏提示词"        # 或 --prompt-file <路径>
 ```
 
-在条目边界优雅停下正在跑的任务（避免命令执行到一半被拦腰），然后用**同一个 session**
-续接新提示词，返回新的 run_id。停止那一刻之前的上下文全部保留。`--grace N` 控制等待
-边界的秒数（默认 20，超时强停）。
+**明确它是什么**：在条目边界优雅停下正在跑的任务（避免命令执行到一半被拦腰），然后用
+**同一个 session** 续接新提示词——是"打断再续跑"，不是无中断的旁路消息（`codex exec`
+没有给运行中进程的输入通道，这是结构限制）。停止那一刻之前的上下文全部保留。
+`--grace N` 控制等待边界的秒数（默认 20，超时强停）。
+
+输出最后一行是结构化 JSON：`{"steer": {"old_run", "new_run", "session_id", "boundary"}}`
+——**监控目标要切到 new_run**；旧 run 的状态会写入 `superseded_by`，会话索引
+（`~/.codex-orchestrator/sessions.json`）始终指向当前 run。
 
 只想停不想续：
 
@@ -152,6 +174,17 @@ python .../codexctl.py fork <session-id>                  # 只分叉不执行�
 
 `compact` 会临时拉起 app-server 对该会话做真实的上下文压缩（压缩事件写进会话文件，
 完成后自动确认）。长会话在 `status` 显示上下文占用偏高时先压缩再续接。
+
+**长任务的标准压缩流程用一条原子命令**（推荐 60% 关注、75% 写检查点、80% 压缩的节奏）：
+
+```bash
+python .../codexctl.py ccr <run> --prompt-file 续跑提示.md
+```
+
+`checkpoint-compact-resume`（别名 `ccr`）一口气完成：边界停下 → 让代理写 CHECKPOINT.md
+（已完成/半成品/恢复第一步/剩余清单）→ 压缩并验证压缩事件 → 用续跑提示恢复，输出新
+run id。压缩未确认会**在恢复前中止**，会话与检查点原样保留，可加大 `--timeout` 重试。
+检查点指令可用 `--checkpoint-prompt` 覆盖。
 
 `fork`（以及 `dispatch --fork-from`）优先走 Codex 原生分叉：谱系正确、正规入库、
 且在 TUI resume 里默认可见；原生面不可用时自动回退为手工复制会话文件。父会话
