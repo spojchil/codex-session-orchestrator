@@ -68,8 +68,14 @@ watch: python .../codexctl.py watch r-20250101-120000-ab12
 python .../codexctl.py status            # 最近一个 run；也可给 run_id 或唯一前缀
 python .../codexctl.py watch <run>       # 刷屏跟踪直到结束，结束时打印最终回复
 python .../codexctl.py events <run> -n 30
-python .../codexctl.py list
+python .../codexctl.py list              # 全部 run，并实况核对：LIVE = 进程真活着
+python .../codexctl.py list -C           # 只看当前目录工作区的（-C <目录> 指定别处）
 ```
+
+**"我关了那个终端，代理还活着吗？"——跑 `list` 就知道。**派发方终端关闭不影响任务
+（监督进程是独立的分离进程），在任何终端、任何目录都能列出全机的 run 并核对实况：
+`LIVE Np` 表示监督进程活着且 Job 里有 N 个进程；账面在跑但进程已死的孤儿记录会被
+自动修正为 `failed` 并补写终态（标 `healed`）。
 
 `status` 一屏包含：阶段（requesting_model / reasoning / running_tool / completed / failed /
 cancelled）、正在执行的命令、计划完成度（Codex 自己维护的 todo list）、token 用量与

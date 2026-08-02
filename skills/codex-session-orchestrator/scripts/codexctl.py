@@ -1121,16 +1121,69 @@ def cmd_watch(args):
         time.sleep(args.interval)
 
 
+def verify_run(run_dir: Path, state: dict) -> tuple:
+    """Ground truth for one run: is anything actually alive? Heals orphaned records.
+
+    A non-terminal phase only means the supervisor was alive at the last state write.
+    If the supervisor is gone, KILL_ON_JOB_CLOSE took the codex tree with it — the
+    record is a corpse claiming to be running, so mark it failed and write the
+    missing terminal record."""
+    phase = state.get("phase", "?")
+    if phase in TERMINAL_PHASES:
+        return phase, ""
+    sup = state.get("supervisor_pid")
+    sup_alive = bool(sup and pid_alive(sup))
+    codex_alive = bool(state.get("codex_pid") and pid_alive(state["codex_pid"]))
+    if sup_alive:
+        procs = ""
+        if IS_WIN:
+            job = JobObject.open_existing(run_dir.name)
+            if job:
+                procs = str((job.sample() or {}).get("active_processes", "?"))
+        return phase, f"LIVE {procs}p" if procs else "LIVE"
+    if codex_alive:
+        # Should not happen on Windows (job close kills the tree); flag it loudly.
+        return phase, f"ORPHAN pid={state.get('codex_pid')}"
+    reason = "supervisor died mid-run; tree killed by job close (record healed by list)"
+    state.update({"phase": "failed", "last_error": reason})
+    try:
+        atomic_write_json(run_dir / "state.json", state)
+        if not read_json(run_dir / "result.json"):
+            sid = state.get("session_id")
+            atomic_write_json(run_dir / "result.json", {
+                "run_id": run_dir.name, "phase": "failed", "reason": reason,
+                "exit_code": None, "finished_at": utcnow_iso(), "session_id": sid,
+                "resume_cmd": f'python "{SELF}" resume {sid} "<prompt>"' if sid else None,
+            })
+    except OSError:
+        pass
+    return "failed", "healed"
+
+
 def cmd_list(args):
     root = runs_root()
     if not root.exists():
         print("no runs recorded yet")
         return
-    rows = sorted(root.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)[: args.limit]
-    print(f"{'run_id':26s} {'phase':11s} {'age':>7s} {'session':10s} {'cwd':30s} prompt")
-    print("-" * 110)
+    project = None
+    if args.project_dir:
+        project = str(Path(args.project_dir).resolve())
+    rows = sorted(root.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+    shown = 0
+    print(f"{'run_id':26s} {'phase':11s} {'alive':12s} {'age':>7s} {'session':10s} "
+          f"{'cwd':28s} prompt")
+    print("-" * 120)
     for run_dir in rows:
+        if shown >= args.limit:
+            break
         state = read_json(run_dir / "state.json") or {}
+        if project:
+            try:
+                if str(Path(state.get("cwd") or "").resolve()) != project:
+                    continue
+            except OSError:
+                continue
+        phase, alive = verify_run(run_dir, state)
         age = fmt_secs(time.time() - run_dir.stat().st_mtime)
         prompt = ""
         try:
@@ -1138,8 +1191,11 @@ def cmd_list(args):
         except OSError:
             pass
         sid = (state.get("session_id") or "")[:8]
-        print(f"{run_dir.name:26s} {state.get('phase', '?'):11s} {age:>7s} {sid:10s} "
-              f"{trim(state.get('cwd') or '', 30):30s} {trim(prompt, 40)}")
+        print(f"{run_dir.name:26s} {phase:11s} {alive:12s} {age:>7s} {sid:10s} "
+              f"{trim(state.get('cwd') or '', 28):28s} {trim(prompt, 36)}")
+        shown += 1
+    if not shown:
+        print(f"no runs match {project or ''}")
 
 
 def request_supervisor_cancel(run_dir: Path, grace: int, reason: str) -> bool:
@@ -1507,8 +1563,10 @@ def main():
     p.add_argument("session_id")
     p.set_defaults(func=cmd_fork)
 
-    p = sub.add_parser("list", help="List recent runs.")
+    p = sub.add_parser("list", help="List runs; verifies liveness and heals orphaned records.")
     p.add_argument("-n", "--limit", type=int, default=20)
+    p.add_argument("-C", "--project-dir", nargs="?", const=".", default=None, metavar="DIR",
+                   help="Only runs for this workspace (bare -C = current directory).")
     p.set_defaults(func=cmd_list)
 
     p = sub.add_parser("supervise", help=argparse.SUPPRESS)
