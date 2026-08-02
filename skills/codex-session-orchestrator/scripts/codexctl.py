@@ -1146,8 +1146,12 @@ def cmd_steer(args):
                 hard_kill(run_dir)
                 wait_terminal(run_dir, 10)
         else:
+            # Dead supervisor: record the terminal state ourselves, before moving on, so the
+            # old run never reads as still running.
             hard_kill(run_dir)
-            time.sleep(1)
+            state = read_json(run_dir / "state.json") or {}
+            state.update({"phase": "cancelled", "cancel_requested": "steer (supervisor was gone)"})
+            atomic_write_json(run_dir / "state.json", state)
         print(f"stopped {run_dir.name}")
 
     cfg = dict(old_cfg)

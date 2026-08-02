@@ -8,6 +8,8 @@ A Claude Code skill that drives the **local OpenAI Codex CLI** as a persistent, 
 
 Running `codex exec` from an agent normally means blocking on a black box: no session id until it finishes, no idea what it is doing, and the only way to change course is to kill it blind. This skill fixes all of that:
 
+**How this differs from other Claude↔Codex plugins**: most plugins in this space are synchronous bridges (send a prompt, wait, read the answer) or review/debate workflows. Auditing the closest alternatives (mid-2026), none offers: a live state file parsed from Codex's event stream, mid-run steering (they close the child's stdin at spawn, so it is structurally impossible), kernel-level process-tree control (Job Objects, not single-PID kills), forced context compaction, context-window occupancy tracking, or search across your local `~/.codex` session archive. That layer is this plugin.
+
 - **Instant dispatch** — returns `run_id` + `session_id` within seconds (parsed from the event stream), while the task keeps running in the background under a detached supervisor.
 - **Live structured state** — one `state.json` per run: phase (requesting_model / reasoning / running_tool / …), current command, Codex's own todo-list progress, token usage with **context-window occupancy %**, changed files, health alerts, and whole-process-tree CPU/IO/memory (Windows Job Object accounting).
 - **Steer mid-run** — `steer` stops the task at an item boundary and resumes the *same session* with a correction prompt. No wasted context, no half-written files.
