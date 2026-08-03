@@ -551,7 +551,8 @@ class Supervisor:
             self.turn_failed_error = (obj.get("error") or {}).get("message") or "turn failed"
             self.set(phase="failed", last_error=self.turn_failed_error)
         elif typ == "error":
-            self.set(last_error=obj.get("message") or "")
+            self.set(last_error=obj.get("message") or "", last_error_resolved=False,
+                     last_error_at=ts)
         elif typ in ("item.started", "item.updated", "item.completed"):
             self.on_item(ts, typ, obj.get("item") or {})
         elif typ == "unknown" or typ is None:
@@ -588,6 +589,10 @@ class Supervisor:
             if self.current_item and self.current_item.get("kind") == kind:
                 duration = round(time.monotonic() - self.current_item["started"], 1)
             self.current_item = None
+            # Progress after a transient error (reconnects etc.) means it recovered:
+            # keep it out of the current-error slot, it stays in events.jsonl.
+            if self.state.get("last_error") and not self.state.get("last_error_resolved"):
+                self.set(last_error_resolved=True)
             if kind == "command_execution":
                 counts["commands"] = counts.get("commands", 0) + 1
                 counts["commands_since_diff"] = counts.get("commands_since_diff", 0) + 1
@@ -867,6 +872,16 @@ class Supervisor:
             # Normalized at dispatch; shown here so a misconfigured guard is visible
             # instead of silently firing.
             self.set(allowed_paths=cfg["allowed_paths"])
+        # The effective execution profile is auditable even when the codex command line
+        # does not repeat it (a resume inherits the session's previous profile).
+        self.set(execution_profile={
+            key: cfg.get(key) for key in
+            ("model", "reasoning_effort", "sandbox", "profile", "add_dirs", "on_alert")
+            if cfg.get(key)})
+        if cfg.get("profile_inherited_from"):
+            self.set(profile_inherited_from=cfg["profile_inherited_from"],
+                     profile_inherited=cfg.get("profile_inherited"),
+                     profile_overridden=cfg.get("profile_overridden"))
         self.set(progress_path=str(self.progress_path()))
         self.init_progress()
         self.flush(force=True)
@@ -1009,6 +1024,23 @@ class Supervisor:
 # ---------------------------------------------------------------------------- client commands
 
 
+# Defaults applied only after inheritance: argparse keeps every flag at None so an
+# omitted flag is distinguishable from an explicitly passed default, and a resume can
+# inherit the session's previous execution profile instead of silently dropping it.
+HARD_DEFAULTS = {
+    "max_silence": 600, "max_commands_no_diff": 0, "max_items": 0, "max_runtime": 0,
+    "max_repeat_command": 0, "context_alert_pct": 90, "on_alert": "warn",
+    "progress_file": ".codex-progress.jsonl",
+}
+
+INHERITABLE = (
+    "sandbox", "model", "reasoning_effort", "profile", "add_dirs",
+    "no_skip_git_repo_check", "allowed_paths", "max_silence", "max_commands_no_diff",
+    "max_items", "max_runtime", "max_repeat_command", "context_alert_pct", "on_alert",
+    "progress_file",
+)
+
+
 def shared_dispatch_flags(p: argparse.ArgumentParser):
     p.add_argument("-C", "--project-dir", default=None,
                    help="Directory codex runs in. Resumes inherit the session's previous "
@@ -1020,81 +1052,106 @@ def shared_dispatch_flags(p: argparse.ArgumentParser):
     p.add_argument("--profile")
     p.add_argument("--add-dir", action="append", default=[], metavar="DIR")
     p.add_argument("--no-skip-git-repo-check", action="store_true")
-    p.add_argument("--max-silence", type=int, default=600,
+    p.add_argument("--max-silence", type=int, default=None,
                    help="Alert after N seconds without codex events (0 = off, default 600).")
-    p.add_argument("--max-commands-no-diff", type=int, default=0,
+    p.add_argument("--max-commands-no-diff", type=int, default=None,
                    help="Alert after N commands with no file change (0 = off).")
-    p.add_argument("--max-items", type=int, default=0, help="Alert past N items (0 = off).")
-    p.add_argument("--max-runtime", type=int, default=0, help="Alert past N seconds (0 = off).")
-    p.add_argument("--max-repeat-command", type=int, default=0,
-                   help="Alert when the same command runs N times (0 = off).")
+    p.add_argument("--max-items", type=int, default=None, help="Alert past N items (0 = off).")
+    p.add_argument("--max-runtime", type=int, default=None, help="Alert past N seconds (0 = off).")
+    p.add_argument("--max-repeat-command", type=int, default=None,
+                   help="Alert when the same command runs N times with no diff (0 = off).")
     p.add_argument("--allowed-path", action="append", default=[], metavar="DIR",
                    help="Alert on file changes outside these roots (repeatable).")
-    p.add_argument("--context-alert-pct", type=int, default=90)
-    p.add_argument("--on-alert", choices=["warn", "cancel"], default="warn",
+    p.add_argument("--context-alert-pct", type=int, default=None)
+    p.add_argument("--on-alert", choices=["warn", "cancel"], default=None,
                    help="cancel = auto soft-cancel when any health rule fires.")
-    p.add_argument("--progress-file", default=".codex-progress.jsonl", metavar="NAME",
+    p.add_argument("--progress-file", default=None, metavar="NAME",
                    help="Workspace-relative file the agent may append progress reports to.")
     p.add_argument("--prompt-file", metavar="PATH",
                    help="Read the prompt from a file (wins over the positional prompt).")
     p.add_argument("--wait", action="store_true", help="Block until the run finishes.")
 
 
-def session_cwd(session_id: str):
-    """The workspace the session last ran in, via the session index."""
+def previous_run_cfg(session_id: str) -> tuple:
+    """(run.json of the session's current run, its run id) — the inheritance source."""
     if not session_id:
-        return None
+        return {}, None
     index = read_json(sessions_index_path()) or {}
     current = (index.get(session_id) or {}).get("current_run_id")
     if not current:
-        return None
-    run_cfg = read_json(runs_root() / current / "run.json") or {}
-    return run_cfg.get("cwd")
+        return {}, None
+    return (read_json(runs_root() / current / "run.json") or {}), current
 
 
 def cfg_from_args(args, resume_id=None, fork_from=None) -> dict:
     # A resume that omits -C must land in the session's own worktree, not wherever the
     # orchestrator happens to be standing — with a wide sandbox that difference is how
     # half-finished work ends up in the main repo.
-    inherited = session_cwd(resume_id or fork_from)
-    if args.project_dir and inherited and \
-            str(Path(args.project_dir).resolve()) != str(Path(inherited).resolve()):
-        print(f"warning: -C differs from the session's previous cwd ({inherited}); "
+    prev, prev_run_id = previous_run_cfg(resume_id or fork_from)
+    inherited_cwd = prev.get("cwd")
+    if args.project_dir and inherited_cwd and \
+            str(Path(args.project_dir).resolve()) != str(Path(inherited_cwd).resolve()):
+        print(f"warning: -C differs from the session's previous cwd ({inherited_cwd}); "
               f"proceeding with the explicit -C", file=sys.stderr)
-    project_dir = Path(args.project_dir or inherited or os.getcwd()).resolve()
+    project_dir = Path(args.project_dir or inherited_cwd or os.getcwd()).resolve()
     if not project_dir.exists():
         raise SystemExit(f"project directory does not exist: {project_dir}")
     if project_dir == Path.home():
         raise SystemExit(
             "refusing to run with the home directory as -C: the managed sandbox cannot spawn "
             "child processes there. Point -C at a project and use --add-dir for extras.")
-    return {
-        "run_id": new_run_id(),
-        "cwd": str(project_dir),
+
+    # Explicit flag > session's previous run > hard default. A bare resume no longer
+    # silently drops model/sandbox/guards — the state stays auditable across resumes.
+    explicit = {
         "sandbox": args.sandbox,
         "model": args.model,
         "reasoning_effort": args.reasoning_effort,
         "profile": args.profile,
-        "add_dirs": args.add_dir,
-        "no_skip_git_repo_check": args.no_skip_git_repo_check,
-        "resume_id": resume_id,
-        "fork_from": fork_from,
-        "max_silence": args.max_silence,
-        "max_commands_no_diff": args.max_commands_no_diff,
-        "max_items": args.max_items,
-        "max_runtime": args.max_runtime,
-        "max_repeat_command": args.max_repeat_command,
+        "add_dirs": args.add_dir or None,
+        "no_skip_git_repo_check": args.no_skip_git_repo_check or None,
         # Anchor relative allowed roots to the project dir at dispatch time. The
         # supervisor runs with the run directory as cwd, so resolving there made every
         # relative root a guaranteed (false) path_violation.
         "allowed_paths": [
             str((Path(p) if Path(p).is_absolute() else project_dir / p).resolve())
-            for p in args.allowed_path],
+            for p in args.allowed_path] or None,
+        "max_silence": args.max_silence,
+        "max_commands_no_diff": args.max_commands_no_diff,
+        "max_items": args.max_items,
+        "max_runtime": args.max_runtime,
+        "max_repeat_command": args.max_repeat_command,
         "context_alert_pct": args.context_alert_pct,
         "on_alert": args.on_alert,
         "progress_file": args.progress_file,
+    }
+    cfg = {
+        "run_id": new_run_id(),
+        "cwd": str(project_dir),
+        "resume_id": resume_id,
+        "fork_from": fork_from,
         "created_at": utcnow_iso(),
     }
+    inherited_keys, overridden_keys = [], []
+    for key in INHERITABLE:
+        fallback = HARD_DEFAULTS.get(
+            key, [] if key in ("add_dirs", "allowed_paths")
+            else (False if key == "no_skip_git_repo_check" else None))
+        prev_value = prev.get(key)
+        if explicit.get(key) is not None:
+            cfg[key] = explicit[key]
+            if prev and prev_value not in (None, [], False) and prev_value != explicit[key]:
+                overridden_keys.append(key)
+        elif prev and prev_value not in (None, [], False):
+            cfg[key] = prev_value
+            inherited_keys.append(key)
+        else:
+            cfg[key] = fallback
+    if prev_run_id:
+        cfg["profile_inherited_from"] = prev_run_id
+        cfg["profile_inherited"] = inherited_keys
+        cfg["profile_overridden"] = overridden_keys
+    return cfg
 
 
 def pick_run(args, default=None) -> str:
@@ -1272,6 +1329,8 @@ def render_status(run_dir: Path, as_json=False):
         print(f"report:   [historical, previous run] {'  '.join(parts)}")
     tokens = state.get("tokens") or {}
     total = tokens.get("total") or {}
+    if live and not total:
+        print("tokens:   (pending first sample)")
     if total:
         line = (f"tokens:   in {total.get('input_tokens', 0):,}"
                 f" (cached {total.get('cached_input_tokens', 0):,})"
@@ -1311,7 +1370,12 @@ def render_status(run_dir: Path, as_json=False):
     if result:
         print(f"result:   [{result.get('phase')}] {result.get('reason')}"
               f"  exit={result.get('exit_code')}")
-    if state.get("last_error") and phase != "completed":
+    review = read_json(run_dir / "review.json")
+    if review:
+        print(f"review:   {review.get('verdict')}"
+              + (f"  {trim(review.get('note'), 100)}" if review.get("note") else ""))
+    if state.get("last_error") and phase != "completed" \
+            and not state.get("last_error_resolved"):
         print(f"error:    {trim(state.get('last_error'), 160)}")
     if state.get("unknown_events"):
         print(f"note:     unknown event types seen (CLI schema drift?): "
@@ -1406,6 +1470,16 @@ def verify_run(run_dir: Path, state: dict) -> tuple:
     except OSError:
         pass
     return "failed", "healed"
+
+
+def cmd_mark(args):
+    """Parent-side verdict, written by the ORCHESTRATOR only — an agent's `completed`
+    is its own claim; acceptance is recorded here and never by the executor."""
+    run_dir = resolve_run_dir(pick_run(args))
+    verdict = "accepted_by_parent" if args.accepted else "returned_for_rework"
+    review = {"verdict": verdict, "note": args.note or "", "ts": utcnow_iso()}
+    atomic_write_json(run_dir / "review.json", review)
+    print(f"{run_dir.name}: {verdict}" + (f"  ({args.note})" if args.note else ""))
 
 
 def cmd_list(args):
@@ -1554,6 +1628,7 @@ def cmd_steer(args):
     # boundary semantics: "completed" = the old run had already finished (lossless),
     # "item" = stopped between items (cheap), "forced" = grace expired mid-item and
     # in-flight remote reasoning was discarded (lossy — treat as a real interruption).
+    warn_if_temporary_change(state, "steering")
     entry_phase = state.get("phase")
     if entry_phase in TERMINAL_PHASES:
         boundary = "completed"
@@ -1564,11 +1639,13 @@ def cmd_steer(args):
 
     cfg = dict(old_cfg)
     cfg.update({"run_id": new_run_id(), "resume_id": session_id, "fork_from": None,
-                "created_at": utcnow_iso(), "steered_from": run_dir.name})
+                "created_at": utcnow_iso(), "steered_from": run_dir.name,
+                "steer_reason": args.reason})
     launch(cfg, prompt, wait=args.wait)
     print(json.dumps({"steer": {
         "old_run": run_dir.name, "new_run": cfg["run_id"], "session_id": session_id,
         "boundary": boundary,
+        "reason": args.reason,
         "mode": "interrupt-and-resume",
     }}, ensure_ascii=False))
 
@@ -1731,10 +1808,21 @@ def rollout_compaction_count(session_id: str) -> int:
     return count
 
 
+def compaction_log(entry: dict):
+    entry["ts"] = utcnow_iso()
+    try:
+        append_jsonl(orch_home() / "compactions.jsonl", entry)
+    except OSError:
+        pass
+
+
 def run_compaction(session_id: str, timeout: int) -> bool:
     """Compacts a session via app-server; True only when the compaction is confirmed
-    (contextCompaction item completed, or the rollout gained a context_compacted event)."""
+    (contextCompaction item completed, or the rollout gained a context_compacted event).
+    False means the WAIT timed out — the remote compaction may still complete later."""
     before = rollout_compaction_count(session_id)
+    compaction_log({"session_id": session_id, "event": "requested", "before_events": before,
+                    "timeout_s": timeout})
     client = AppServerClient()
     try:
         appserver_session(client)
@@ -1747,13 +1835,19 @@ def run_compaction(session_id: str, timeout: int) -> bool:
                 item = params.get("item") or {}
                 if note.get("method") == "item/completed" \
                         and item.get("type") == "contextCompaction":
+                    compaction_log({"session_id": session_id, "event": "confirmed",
+                                    "after_events": rollout_compaction_count(session_id)})
                     return True
                 if note.get("method") == "error":
                     err = (params.get("error") or {}).get("message")
                     print(f"  transient: {err}", flush=True)
             if rollout_compaction_count(session_id) > before:
+                compaction_log({"session_id": session_id, "event": "confirmed",
+                                "after_events": rollout_compaction_count(session_id)})
                 return True
             time.sleep(3)
+        compaction_log({"session_id": session_id, "event": "wait_timed_out",
+                        "note": "remote compaction may still complete"})
         return False
     finally:
         client.close()
@@ -1765,7 +1859,12 @@ def cmd_compact(args):
         print(f"compacted OK  (rollout context_compacted events: "
               f"{rollout_compaction_count(args.session_id)})")
     else:
-        raise SystemExit("timed out waiting for compaction; check the session manually")
+        count = rollout_compaction_count(args.session_id)
+        raise SystemExit(
+            f"the WAIT timed out — this is not proof the compaction failed. The remote "
+            f"side may still complete it: re-check the session's context_compacted count "
+            f"(now {count}) with codex-trace before retrying. "
+            f"Log: {orch_home() / 'compactions.jsonl'}")
 
 
 def make_checkpoint_prompt(cwd: str, progress_file: str) -> str:
@@ -1775,11 +1874,24 @@ def make_checkpoint_prompt(cwd: str, progress_file: str) -> str:
     checkpoint = Path(cwd) / "CHECKPOINT.md"
     progress = Path(cwd) / progress_file
     return (
-        f"把当前进度写成 checkpoint，只做这一件事：写入或更新 {checkpoint}（必须用这个绝对路径），"
-        "内容包括（1）已完成的事项，（2）改到一半的文件与所处状态，（3）恢复工作的第一条命令，"
-        f"（4）剩余待办清单，（5）不许越出的范围。同时向 {progress}（绝对路径）追加一行 "
-        '{"phase":"checkpoint"}。不要做任何其他修改，写完立即回复 checkpoint-done。'
+        f"把当前进度写成 checkpoint，禁止继续实现或扩展任何功能。第一步：立刻向 {progress}"
+        '（绝对路径）追加一行 {"phase":"checkpoint_started"}。第二步：写入或更新 '
+        f"{checkpoint}（必须用这个绝对路径），内容包括（1）已完成的事项，（2）改到一半的"
+        "文件与所处状态，（3）恢复工作的第一条命令，（4）剩余待办清单，（5）不许越出的范围。"
+        f'第三步：向 {progress} 追加一行 {{"phase":"checkpoint"}}。'
+        "不要做任何其他修改，写完立即回复 checkpoint-done。"
     )
+
+
+def warn_if_temporary_change(state: dict, action: str):
+    """A reported in-flight mutation (deliberately broken code with a restore plan)
+    should be restored before anything that snapshots or interrupts the session."""
+    report = state.get("agent_report") or {}
+    for source in (report.get("last"), report.get("inherited")):
+        if isinstance(source, dict) and source.get("temporary_change_active"):
+            print(f"warning: agent reported temporary_change_active — ensure the "
+                  f"mutation is restored before {action}", file=sys.stderr)
+            return
 
 
 def cmd_ccr(args):
@@ -1807,6 +1919,7 @@ def cmd_ccr(args):
         except OSError:
             pass
 
+    warn_if_temporary_change(state, "checkpoint/compact")
     if state.get("phase") not in TERMINAL_PHASES:
         print("1/4 stopping at item boundary...")
         txn_phase("stopping_source")
@@ -1920,9 +2033,22 @@ def main():
     p.add_argument("prompt", nargs="?")
     p.add_argument("--run-id", dest="run_id_opt", metavar="RUN")
     p.add_argument("--prompt-file", metavar="PATH")
+    p.add_argument("--reason", metavar="TYPE",
+                   help="Why this steer happened (e.g. constraint_update, bug_return, "
+                        "checkpoint_request) — recorded in the output and the new run.")
     p.add_argument("--grace", type=int, default=20)
     p.add_argument("--wait", action="store_true")
     p.set_defaults(func=cmd_steer)
+
+    p = sub.add_parser("mark", help="Record the parent-side verdict on a run "
+                                    "(never written by the executor).")
+    p.add_argument("run", nargs="?", default=None)
+    p.add_argument("--run-id", dest="run_id_opt", metavar="RUN")
+    group = p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--accepted", action="store_true")
+    group.add_argument("--returned", action="store_true")
+    p.add_argument("--note", metavar="TEXT")
+    p.set_defaults(func=cmd_mark)
 
     p = sub.add_parser("checkpoint-compact-resume", aliases=["ccr"],
                        help="One transaction: checkpoint turn, compact, resume from a prompt file.")

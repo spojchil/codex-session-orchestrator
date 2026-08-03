@@ -152,7 +152,13 @@ python .../codexctl.py steer <run> "纠偏提示词"        # 或 --prompt-file 
 | `item` | 在条目边界停下 | 低（已完成的工作全保留） |
 | `forced` | 宽限期内没等到边界，强停 | **有损**：在途的远端推理被丢弃，按一次真实中断对待 |
 
-等边界期间 `status` 会显示 `pending:` 行（已请求、正在等边界）。
+等边界期间 `status` 会显示 `pending:` 行（已请求、正在等边界）。`--reason
+constraint_update|bug_return|checkpoint_request` 可标注这次纠偏的性质，写进输出 JSON 和
+新 run 配置，便于事后区分"外部规范更新"与"实现返工"。
+
+若代理上报过 `temporary_change_active`（故意的临时破坏性变更），steer/ccr 会先警告
+"确认变异已恢复"再继续——任务书里可约定：做临时变异前上报
+`{"temporary_change_active": {"restore_plan": "...", "test": "..."}}`，恢复后上报解除。
 
 只想停不想续：
 
@@ -191,13 +197,28 @@ python .../codexctl.py compact <session-id>               # 主动触发上下�
 python .../codexctl.py fork <session-id>                  # 只分叉不执行，返回新 id
 ```
 
-**`resume` 不带 `-C` 时自动继承该会话上一个 run 的工作目录**——手工续跑不会再落到
-编排方当前所在的目录（多工作树 + 宽沙箱下那是把半成品写进主仓库的路）。显式 `-C`
-仍可覆盖，但与会话历史目录不一致时会打警告。`recommended_resume` / `result.json`
-里的续跑命令永远带绝对 `-C`。
+**`resume` 继承的不只是目录，而是完整执行档案**：不带参数的续跑自动继承该会话上一个
+run 的工作目录、model、reasoning-effort、sandbox、allowed-path、健康阈值和 progress
+文件——裸 resume 不会再悄悄丢掉"gpt-5.6 + max + 路径约束"。显式参数覆盖继承值；
+`state.json` 里 `execution_profile` 是最终生效配置，`profile_inherited` /
+`profile_overridden` 列出每一项的来源，审计者不用猜。显式 `-C` 与会话历史目录不一致
+时会打警告。`recommended_resume` / `result.json` 里的续跑命令永远带绝对 `-C`。
+
+父审验收用 `mark` 记录（执行代理永远无法自标通过）：
+
+```bash
+python .../codexctl.py mark <run> --accepted --note "163 项测试独立复核通过"
+python .../codexctl.py mark <run> --returned --note "epoch 贴标反例，返修"
+```
+
+写入 run 目录的 `review.json`，`status` 显示 `review:` 行——`completed` 只是执行代理
+自己的说法，`accepted_by_parent` 才是验收。
 
 `compact` 会临时拉起 app-server 对该会话做真实的上下文压缩（压缩事件写进会话文件，
-完成后自动确认）。长会话在 `status` 显示上下文占用偏高时先压缩再续接。
+完成后自动确认）。长会话在 `status` 显示上下文占用偏高时先压缩再续接。**超时 ≠ 失败**：
+超时只表示"等待结束"，远端压缩可能仍会完成——先用 codex-trace 核对会话的
+`context_compacted` 计数再决定是否重试；每次压缩请求/确认/超时都记录在
+`~/.codex-orchestrator/compactions.jsonl`。
 
 **长任务的标准压缩流程用一条原子命令**（推荐 60% 关注、75% 写检查点、80% 压缩的节奏）：
 
