@@ -59,7 +59,8 @@ watch: python .../codexctl.py watch r-20250101-120000-ab12
 --max-commands-no-diff N   连续 N 条命令没有产生文件改动
 --max-items N              条目总数上限
 --max-runtime N            总时长上限（秒）
---max-repeat-command N     同一命令重复 N 次
+--max-repeat-command N     同一命令重复 N 次（仅计"完全相同且期间无文件改动"的重复；
+                           修一次跑一次的正常修复循环不会触发）
 --allowed-path DIR         文件改动越出这些根目录即告警（可重复；相对路径以 -C 为锚，
                            规范化结果写在 state.json 的 allowed_paths 里）
 --context-alert-pct 90     上下文占用百分比告警线
@@ -75,6 +76,9 @@ python .../codexctl.py events <run> -n 30
 python .../codexctl.py list              # 全部 run，并实况核对：LIVE = 进程真活着
 python .../codexctl.py list -C           # 只看当前目录工作区的（-C <目录> 指定别处）
 ```
+
+所有吃 run 的子命令（status/watch/events/cancel/steer/ccr）同时接受位置参数和
+`--run-id <run>`，两种写法等价。
 
 **"我关了那个终端，代理还活着吗？"——跑 `list` 就知道。**派发方终端关闭不影响任务
 （监督进程是独立的分离进程），在任何终端、任何目录都能列出全机的 run 并核对实况：
@@ -204,7 +208,16 @@ python .../codexctl.py ccr <run> --prompt-file 续跑提示.md
 `checkpoint-compact-resume`（别名 `ccr`）一口气完成：边界停下 → 让代理写 CHECKPOINT.md
 （已完成/半成品/恢复第一步/剩余清单）→ 压缩并验证压缩事件 → 用续跑提示恢复，输出新
 run id。压缩未确认会**在恢复前中止**，会话与检查点原样保留，可加大 `--timeout` 重试。
-检查点指令可用 `--checkpoint-prompt` 覆盖。
+
+三点须知：
+
+- 事务全程记录在旧 run 目录的 `ccr.json`（各阶段时间戳、子 run id）。ccr 客户端比调用它
+  的 shell 长命——外层超时不代表事务失败，去看 `ccr.json` 和会话索引即可接续追踪。
+- `--checkpoint-prompt` 覆盖检查点指令时，**必须写成"禁止继续实现、只做状态快照"**，
+  并自带绝对目标路径；写成"完成当前小项后再存档"实测会变成几十分钟的继续施工。
+  `--timeout` 只约束压缩确认阶段，不是整个事务的总时限。
+- 一次 ccr 的 `compactions` 计数可能 +2 属正常：检查点短轮自身可能触发一次自动压缩，
+  加上显式压缩各计一次。
 
 `fork`（以及 `dispatch --fork-from`）优先走 Codex 原生分叉：谱系正确、正规入库、
 且在 TUI resume 里默认可见；原生面不可用时自动回退为手工复制会话文件。父会话

@@ -591,9 +591,15 @@ class Supervisor:
             if kind == "command_execution":
                 counts["commands"] = counts.get("commands", 0) + 1
                 counts["commands_since_diff"] = counts.get("commands_since_diff", 0) + 1
-                self.set(last_command={"command": trim(item.get("command"), 300),
-                                       "exit_code": item.get("exit_code"),
-                                       "duration_s": duration})
+                exit_code = item.get("exit_code")
+                last_command = {"command": trim(item.get("command"), 300),
+                                "exit_code": exit_code,
+                                "duration_s": duration}
+                if exit_code == 124:
+                    # Shell-level timeout: the command was cut off, but its descendants
+                    # may keep running detached (observed with cargo builds).
+                    last_command["timed_out"] = True
+                self.set(last_command=last_command)
                 self.check_repeat_reads(item.get("command") or "")
             elif kind == "file_change":
                 counts["file_changes"] = counts.get("file_changes", 0) + 1
@@ -623,14 +629,25 @@ class Supervisor:
         self.point_alert("path_violation", f"file change outside allowed paths: {path}")
 
     def check_repeat_reads(self, command: str):
+        """Counts only exact repeats with NO file change in between: re-running the same
+        test three times while landing fixes between runs is progress, not a loop, and
+        auto-cancelling it was observed killing a healthy repair cycle."""
         limit = self.cfg.get("max_repeat_command", 0)
         if not limit:
             return
+        diff_now = (self.state.get("counts") or {}).get("file_changes", 0)
         seen = self.state.setdefault("command_repeats", {})
-        key = trim(command, 160)
-        seen[key] = seen.get(key, 0) + 1
-        if seen[key] >= limit:
-            self.point_alert("repeat_command", f"same command ran {seen[key]}x: {key}")
+        key = trim(command, 400)
+        entry = seen.get(key)
+        if isinstance(entry, dict) and entry.get("diff_mark") == diff_now:
+            entry["count"] = entry.get("count", 0) + 1
+        else:
+            entry = {"count": 1, "diff_mark": diff_now}
+        seen[key] = entry
+        if entry["count"] >= limit:
+            self.point_alert("repeat_command",
+                             f"same command ran {entry['count']}x with no file change "
+                             f"in between: {trim(command, 120)}")
         if len(seen) > 400:
             seen.clear()
 
@@ -1080,6 +1097,14 @@ def cfg_from_args(args, resume_id=None, fork_from=None) -> dict:
     }
 
 
+def pick_run(args, default=None) -> str:
+    """Positional run and --run-id are interchangeable on every run-taking command."""
+    token = getattr(args, "run_id_opt", None) or getattr(args, "run", None) or default
+    if not token:
+        raise SystemExit("give a run id (positional or --run-id)")
+    return token
+
+
 def resolve_prompt(args) -> str:
     if getattr(args, "prompt_file", None):
         return Path(args.prompt_file).read_text(encoding="utf-8")
@@ -1226,6 +1251,10 @@ def render_status(run_dir: Path, as_json=False):
     if live and state.get("cancel_requested") and phase not in TERMINAL_PHASES:
         print(f"pending:  cancel/steer requested ({state['cancel_requested']}) — "
               f"waiting for an item boundary")
+    lc = state.get("last_command") or {}
+    if live and lc.get("timed_out"):
+        print(f"warning:  last command hit its timeout (exit 124): {trim(lc.get('command'), 70)}")
+        print("          its descendants may still be running detached — check perf pids/CPU")
     progress = state.get("progress")
     if progress:
         print(f"plan:     {progress['completed']}/{progress['total']} done")
@@ -1317,7 +1346,7 @@ def git_snapshot(cwd: str, baseline: str):
 
 
 def cmd_status(args):
-    run_dir = resolve_run_dir(args.run)
+    run_dir = resolve_run_dir(pick_run(args, default="latest"))
     render_status(run_dir, as_json=args.json)
     if args.diff and not args.json:
         state = read_json(run_dir / "state.json") or {}
@@ -1326,7 +1355,7 @@ def cmd_status(args):
 
 
 def cmd_watch(args):
-    run_dir = resolve_run_dir(args.run)
+    run_dir = resolve_run_dir(pick_run(args, default="latest"))
     while True:
         os.system("cls" if IS_WIN else "clear")
         render_status(run_dir)
@@ -1461,7 +1490,7 @@ def wait_terminal(run_dir: Path, timeout: float) -> dict:
 
 
 def cmd_cancel(args):
-    run_dir = resolve_run_dir(args.run)
+    run_dir = resolve_run_dir(pick_run(args))
     state = read_json(run_dir / "state.json") or {}
     if state.get("phase") in TERMINAL_PHASES:
         print(f"already {state['phase']}")
@@ -1509,7 +1538,10 @@ def cmd_steer(args):
     """Interrupt-and-resume, by design: `codex exec` has no input channel to a running
     process, so steering means stopping at an item boundary and resuming the SAME
     session with the correction. Context up to the stop is fully preserved."""
-    run_dir = resolve_run_dir(args.run)
+    # `steer --run-id X "msg"` puts the message in the run positional; shuffle it back.
+    if getattr(args, "run_id_opt", None) and args.prompt is None and args.run:
+        args.prompt, args.run = args.run, None
+    run_dir = resolve_run_dir(pick_run(args))
     state = read_json(run_dir / "state.json") or {}
     old_cfg = read_json(run_dir / "run.json") or {}
     session_id = state.get("session_id")
@@ -1542,7 +1574,7 @@ def cmd_steer(args):
 
 
 def cmd_events(args):
-    run_dir = resolve_run_dir(args.run)
+    run_dir = resolve_run_dir(pick_run(args, default="latest"))
     lines = []
     try:
         with (run_dir / "events.jsonl").open(encoding="utf-8") as f:
@@ -1753,7 +1785,7 @@ def make_checkpoint_prompt(cwd: str, progress_file: str) -> str:
 def cmd_ccr(args):
     """Checkpoint -> compact -> resume as one transaction. Aborts before the resume step
     if compaction cannot be confirmed, leaving the session unchanged."""
-    run_dir = resolve_run_dir(args.run)
+    run_dir = resolve_run_dir(pick_run(args))
     state = read_json(run_dir / "state.json") or {}
     session_id = state.get("session_id")
     if not session_id:
@@ -1761,35 +1793,67 @@ def cmd_ccr(args):
     continuation = Path(args.prompt_file).read_text(encoding="utf-8")
     old_cfg = read_json(run_dir / "run.json") or {}
 
+    # Lightweight transaction record: the client may outlive its caller (an observed
+    # 51-minute ccr finished after the calling shell timed out), so every phase is
+    # written to ccr.json in the old run's directory for later inspection.
+    txn_path = run_dir / "ccr.json"
+    txn = {"transaction": "checkpoint-compact-resume", "old_run": run_dir.name,
+           "session_id": session_id, "client_pid": os.getpid(), "phases": []}
+
+    def txn_phase(name, **extra):
+        txn["phases"].append({"phase": name, "ts": utcnow_iso(), **extra})
+        try:
+            atomic_write_json(txn_path, txn)
+        except OSError:
+            pass
+
     if state.get("phase") not in TERMINAL_PHASES:
         print("1/4 stopping at item boundary...")
+        txn_phase("stopping_source")
         stop_run(run_dir, args.grace, "checkpoint-compact-resume")
+        txn_phase("source_stopped")
     else:
         print("1/4 run already terminal")
+        txn_phase("source_already_terminal")
 
-    checkpoint_target = Path(old_cfg.get("cwd", "")) / "CHECKPOINT.md"
-    print(f"2/4 writing checkpoint (short resumed turn) -> {checkpoint_target}")
+    if args.checkpoint_prompt:
+        # A custom instruction chooses its own target — printing our default path here
+        # was observed misleading the operator into thinking the file was missing.
+        print("2/4 writing checkpoint (custom instruction; target defined by your prompt)...")
+        checkpoint_target = None
+    else:
+        checkpoint_target = str(Path(old_cfg.get("cwd", "")) / "CHECKPOINT.md")
+        print(f"2/4 writing checkpoint (short resumed turn) -> {checkpoint_target}")
     cfg = dict(old_cfg)
     cfg.update({"run_id": new_run_id(), "resume_id": session_id, "fork_from": None,
                 "created_at": utcnow_iso()})
+    txn_phase("writing_checkpoint", run_id=cfg["run_id"], target=checkpoint_target,
+              custom_prompt=bool(args.checkpoint_prompt))
     launch(cfg, args.checkpoint_prompt or make_checkpoint_prompt(
         old_cfg.get("cwd", ""), old_cfg.get("progress_file") or ".codex-progress.jsonl"),
         wait=True, quiet=True)
+    txn_phase("checkpoint_done", run_id=cfg["run_id"])
 
     print("3/4 compacting...")
+    txn_phase("compacting")
     if not run_compaction(session_id, args.timeout):
+        txn_phase("compact_failed")
         raise SystemExit(
             "compaction not confirmed; ABORTING before resume — session and checkpoint "
-            "are intact, retry with a longer --timeout")
+            "are intact, retry with a longer --timeout (transaction log: ccr.json)")
+    txn_phase("compact_confirmed", events=rollout_compaction_count(session_id))
     print(f"    compacted OK (events: {rollout_compaction_count(session_id)})")
 
     print("4/4 resuming with continuation prompt...")
     cfg = dict(old_cfg)
     cfg.update({"run_id": new_run_id(), "resume_id": session_id, "fork_from": None,
                 "created_at": utcnow_iso(), "steered_from": run_dir.name})
+    txn_phase("resuming", run_id=cfg["run_id"])
     launch(cfg, continuation, wait=args.wait)
+    txn_phase("resumed", run_id=cfg["run_id"])
     print(json.dumps({"checkpoint_compact_resume": {
         "old_run": run_dir.name, "new_run": cfg["run_id"], "session_id": session_id,
+        "transaction_log": str(txn_path),
     }}, ensure_ascii=False))
 
 
@@ -1822,24 +1886,28 @@ def main():
     p.set_defaults(func=cmd_resume)
 
     p = sub.add_parser("status", help="Show a run's current state (run id, prefix, or session id).")
-    p.add_argument("run", nargs="?", default="latest")
+    p.add_argument("run", nargs="?", default=None)
+    p.add_argument("--run-id", dest="run_id_opt", metavar="RUN")
     p.add_argument("--json", action="store_true")
     p.add_argument("--diff", action="store_true",
                    help="Also take a one-shot git snapshot of the workspace (on demand only).")
     p.set_defaults(func=cmd_status)
 
     p = sub.add_parser("watch", help="Live-refresh a run's state until it finishes.")
-    p.add_argument("run", nargs="?", default="latest")
+    p.add_argument("run", nargs="?", default=None)
+    p.add_argument("--run-id", dest="run_id_opt", metavar="RUN")
     p.add_argument("--interval", type=float, default=5)
     p.set_defaults(func=cmd_watch)
 
     p = sub.add_parser("events", help="Tail a run's event log.")
-    p.add_argument("run", nargs="?", default="latest")
+    p.add_argument("run", nargs="?", default=None)
+    p.add_argument("--run-id", dest="run_id_opt", metavar="RUN")
     p.add_argument("-n", "--tail", type=int, default=25)
     p.set_defaults(func=cmd_events)
 
     p = sub.add_parser("cancel", help="Stop a run (soft: waits for an item boundary).")
-    p.add_argument("run")
+    p.add_argument("run", nargs="?", default=None)
+    p.add_argument("--run-id", dest="run_id_opt", metavar="RUN")
     p.add_argument("--grace", type=int, default=20,
                    help="Seconds to wait for an item boundary before force kill.")
     p.add_argument("--hard", action="store_true", help="Kill the tree immediately.")
@@ -1848,8 +1916,9 @@ def main():
     p = sub.add_parser("steer",
                        help="Interrupt-and-resume: stop at an item boundary, resume the "
                             "same session with a correction prompt.")
-    p.add_argument("run")
+    p.add_argument("run", nargs="?", default=None)
     p.add_argument("prompt", nargs="?")
+    p.add_argument("--run-id", dest="run_id_opt", metavar="RUN")
     p.add_argument("--prompt-file", metavar="PATH")
     p.add_argument("--grace", type=int, default=20)
     p.add_argument("--wait", action="store_true")
@@ -1857,7 +1926,8 @@ def main():
 
     p = sub.add_parser("checkpoint-compact-resume", aliases=["ccr"],
                        help="One transaction: checkpoint turn, compact, resume from a prompt file.")
-    p.add_argument("run")
+    p.add_argument("run", nargs="?", default=None)
+    p.add_argument("--run-id", dest="run_id_opt", metavar="RUN")
     p.add_argument("--prompt-file", required=True, metavar="PATH",
                    help="Continuation prompt used for the final resume.")
     p.add_argument("--checkpoint-prompt", metavar="TEXT",
