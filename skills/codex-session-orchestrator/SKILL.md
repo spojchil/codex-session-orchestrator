@@ -272,6 +272,15 @@ python <技能目录>/scripts/codexctl.py dispatch --profile third -C <项目> "
 ```
 
 API key 只走环境变量：沿派发链自然继承到 codex 进程，不进状态文件、事件日志或命令行。
+注意 key 必须存在于**派发方**的环境里（监督进程逐级继承）；比设置 key 更早启动的
+长命 shell 看不到新变量，会得到明确的 Missing environment variable 报错。
+
+**第三方模型务必声明上下文窗口。**codex 对不认识的模型一律按 fallback 元数据假设
+**272k 窗口**——真实窗口更小时，上下文百分比被低估、告警失效、溢出会以 API 报错砸出。
+两种声明方式：简单的 `model_context_window = <N>`（profile 顶层键），或完整的模型目录
+`model_catalog_json = "<路径>/models.json"`（可声明 context_window、推理档位、
+`effective_context_window_percent` 等全套元数据，codex 会按已知模型对待）。状态里
+显示的窗口是**有效窗口**（声明值 × effective 百分比，默认 95%）。
 
 **一条会话线从头到尾用同一个 profile。**会话按线记录 provider，换 provider 去 resume
 同一条会话的兼容性未验证；要换端点就开新会话。
